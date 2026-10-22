@@ -78,13 +78,27 @@ def prefilter(reply: str) -> list[str]:
 WAKE_TOOLS = ("delegate_task", "kanban_create", "kanban_schedule", "cronjob")
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def _lineage(session_id: str, depth: int = 12) -> list[str]:
     """session_id plus its compression ancestors (compression rotates ids; a watcher started before a
     rotation is keyed by the old id)."""
     ids = [session_id]
     try:
         import sqlite3
-        db = sqlite3.connect(f"file:{_hermes_home() / 'state.db'}?mode=ro", uri=True, timeout=1)
+        db = _ro_connect(_hermes_home() / 'state.db', timeout=1)
         try:
             cur = session_id
             for _ in range(depth):

@@ -1,6 +1,6 @@
 ---
 name: claude-usage-diagnostics
-description: "Use when Claude usage runs out or sessions stick on 429s."
+description: "Use when Claude/Codex usage runs out or accounts show red."
 version: 1.0.0
 author: Hermes Agent (curator)
 license: MIT
@@ -84,6 +84,12 @@ Grep transcripts for 429 `task-notification` storms — each names a dead subage
 
 ## Pitfalls
 
+- **A red Codex row can be a stale duplicate login, not a dead account.** Re-adding an account leaves the old pool
+  entry holding its last `usage_limit_reached` until `last_error_reset_at`, while the new entry serves fine. Decode
+  each `credential_pool.openai-codex[].access_token` JWT (`https://api.openai.com/auth.chatgpt_account_id`, `exp`) to
+  find entries sharing an account, check live with `GET https://chatgpt.com/backend-api/wham/usage` (Bearer token +
+  `ChatGPT-Account-Id`; `rate_limit.limit_reached`, `primary_window.used_percent`), then `hermes auth remove
+  openai-codex <stale id>` and prove with a one-line `hermes chat -q ... --provider openai-codex`. No re-auth needed.
 - **Grey / "0/N" usage chips (any usage widget) usually mean expired tokens, not no capacity.** The pool only refreshes a token when it selects that entry, and every usage fetcher (core and community plugins alike) is read-only, so idle accounts' ~8h access tokens lapse → state `unknown`. Check `expires_at_ms` in auth.json first; `hermes auth refresh anthropic <n>` fixes it now (model cooldowns survive the refresh). The `oauth-keepalive` user plugin (`~/.hermes/plugins/oauth-keepalive`) prevents recurrence; if chips grey out again, confirm it's enabled (`hermes plugins list`).
 
 - **`hermes auth refresh anthropic` requires a target** when the pool holds more than one credential — pass an index, entry id, or exact label (`hermes auth refresh anthropic 1`); the bare command just prints usage. Loop `for i in 1 2 3 4 5; do hermes auth refresh anthropic $i; done` to refresh all.

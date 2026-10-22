@@ -105,3 +105,13 @@ test('machineChips + machineArchiveLines match ownership across the lineage only
   const chips = m.machineChips(machines, { gatewayId: 'g', profile: 'default', ids: new Set(['s_tip', 's_root']) })
   assert.deepEqual(m.machineArchiveLines(chips), [{ label: 'Rented machine', value: 'box-1 (running, $0.40/h)' }])
 })
+
+test('scheduled (timer-blocked) chips are yellow, pill included', () => {
+  assert.equal(m.chipColor('scheduled'), '#e3b341')
+  const f = m.chipFrame('scheduled')
+  assert.match(f.border, /#e3b341/)
+  assert.match(f.background, /#e3b341/)
+  // other states keep the neutral frame
+  assert.doesNotMatch(m.chipFrame('todo').border, /#e3b341/)
+  assert.equal(m.chipColor('blocked'), '#f85149')
+})

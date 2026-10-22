@@ -23,6 +23,9 @@
  * 10 s while visible; card details are cached 60 s or until the blocked set changes.
  * Only the FOCUSED session is known to a composer plugin, so every tile's composer
  * renders the focused chat's panel only when that tile is the focused one.
+ *
+ * Retired as a composer panel when user-steps is loaded (window.__userSteps.ownsComposer): its "For you"
+ * strip shows these cards via window.__blockedPanel.{snapshot,subscribe,unblockCard,openCard,checklist}.
  */
 import { COMPOSER_AREAS, host, useValue } from '@hermes/plugin-sdk'
 import { useEffect, useState } from 'react'
@@ -44,7 +47,11 @@ const log = (...a) => console.info(`[${ID}]`, ...a)
 
 // Web URLs, and absolute / home-relative local paths that start a word (so
 // "7/10" or "and/or" never match). Trailing sentence punctuation is not part of the link.
-const LINK_RE = /(https?:\/\/[^\s<>"'`]+)|(?:^|(?<=[\s("'`]))(~?\/[A-Za-z0-9._~-][^\s<>"'`()]*)/g
+// Scheme-less web addresses ("github.com/settings/billing", "www.x.io") link too, but only on a common TLD so
+// file names like plugin.js / README.md never do; "user@host.com" doesn't (no word start).
+const LINK_RE = /(https?:\/\/[^\s<>"'`]+)|(?:^|(?<=[\s("'`]))(~?\/[A-Za-z0-9._~-][^\s<>"'`()]*)|(?:^|(?<=[\s("'`]))((?:[A-Za-z0-9-]+\.)+(?:com|org|net|io|dev|ai|app|co|in|gov|edu|me|sh|so|gg|tv|us|uk|xyz)(?=[\/\s.,;:!?)\]}"'`]|$)(?:\/[^\s<>"'`]*)?)/g
+/** href for a link segment: bare web addresses get https://, paths file://. */
+export const linkHref = x => (x.kind === 'path' ? `file://${x.value}` : /^https?:\/\//i.test(x.value) ? x.value : `https://${x.value}`)
 const TRAIL_RE = /[.,;:!?)\]}]+$/
 
 /** text → [{ kind: 'text'|'url'|'path', value }] for rendering clickable links. */
@@ -56,7 +63,7 @@ export function linkSegments(text) {
     let value = m[0]
     const trail = value.match(TRAIL_RE)?.[0] || ''
     if (trail) value = value.slice(0, -trail.length)
-    const kind = m[1] ? 'url' : 'path'
+    const kind = m[2] ? 'path' : 'url'
     if (kind === 'path' && !/[A-Za-z]/.test(value)) continue
     if (m.index > last) out.push({ kind: 'text', value: s.slice(last, m.index) })
     out.push({ kind, value })
@@ -488,13 +495,13 @@ function Linked({ text }) {
     x.kind === 'text'
       ? x.value
       : jsx('a', {
-          href: x.kind === 'url' ? x.value : `file://${x.value}`,
+          href: linkHref(x),
           'data-blocked-link': x.kind,
-          title: x.kind === 'url' ? x.value : `Open ${x.value}`,
+          title: x.kind === 'url' ? linkHref(x) : `Open ${x.value}`,
           onClick: e => {
             e.preventDefault()
             e.stopPropagation()
-            void openLink(x.value)
+            void openLink(x.kind === 'url' ? linkHref(x) : x.value)
           },
           style: { color: 'var(--accent-foreground, var(--primary, #58a6ff))', textDecoration: 'underline', textUnderlineOffset: 2, cursor: 'pointer', wordBreak: 'break-all' },
           children: x.value
@@ -631,6 +638,9 @@ function Panel() {
   }, [])
 
   if (snap.stored !== focused) return null
+  // user-steps' "For you" strip lists these cards (with the same Done → unblock / Reply & unblock buttons);
+  // this panel only renders when that plugin is absent.
+  if (typeof window !== 'undefined' && window.__userSteps?.ownsComposer) return null
   const { items, parked } = snap
   if (!items.length && !parked) return null
 
@@ -690,7 +700,8 @@ export default {
     ctx.register({ id: 'panel', area: COMPOSER_AREAS.top, order: -20, render: () => jsx(Panel, {}) })
     const onVis = () => document.hidden || void refresh()
     document.addEventListener('visibilitychange', onVis)
-    window.__blockedPanel = { version: 3, get snapshot() { return snapshot }, refresh, checklist }
+    // version 4: subscribe/unblockCard/openCard for user-steps' "For you" strip (it reuses this poller + actions)
+    window.__blockedPanel = { version: 4, get snapshot() { return snapshot }, refresh, checklist, subscribe, unblockCard, openCard }
     return () => {
       document.removeEventListener('visibilitychange', onVis)
       delete window.__blockedPanel

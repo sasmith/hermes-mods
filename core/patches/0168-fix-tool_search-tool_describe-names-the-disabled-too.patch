@@ -1,0 +1,113 @@
+From b4c9a66c5b08a781ed81ecdb53c51b41ff0d6012 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 19:35:00 -0700
+Subject: [PATCH] fix(tool_search): tool_describe names the disabled toolset
+ and the enable command for a registered tool absent from the session [daveey]
+
+A registered, non-deferrable tool whose toolset is off for the platform (e.g. kanban on a host without the
+cli opt-in) was answered with 'directly-listed tool ... Call it directly', though it was in no list. Now:
+'registered but NOT enabled in this session: its toolset X is off ... hermes tools enable X --platform cli'.
+---
+ .../tools/test_tool_describe_gated_toolset.py | 41 +++++++++++++++++++
+ tools/tool_search.py                          |  6 ++-
+ tools/tool_search_validation.py               | 13 +++++-
+ 3 files changed, 57 insertions(+), 3 deletions(-)
+ create mode 100644 tests/tools/test_tool_describe_gated_toolset.py
+
+diff --git a/tests/tools/test_tool_describe_gated_toolset.py b/tests/tools/test_tool_describe_gated_toolset.py
+new file mode 100644
+index 0000000000..7fee2980c2
+--- /dev/null
++++ b/tests/tools/test_tool_describe_gated_toolset.py
+@@ -0,0 +1,41 @@
++"""[daveey] tool_describe on a registered tool whose toolset is off for this session.
++
++Failure (2026-10-21, mini): ~/AGENTS.md requires kanban_create; the mini's cli platform had kanban (default-off)
++disabled, so the tool was absent from the session. tool_describe answered "'kanban_create' is a directly-listed
++tool ... Call it directly" — but it was in no list, so the agent gave up. The error must say it is not enabled
++and how to enable it.
++"""
++import json
++
++import pytest
++
++import tools.tool_search as ts
++from tools.registry import registry
++
++_NAME = "gated_probe_tool"
++
++
++def _td(name):
++    return {"type": "function", "function": {"name": name, "description": "x",
++                                             "parameters": {"type": "object", "properties": {}}}}
++
++
++@pytest.fixture
++def probe_tool(monkeypatch):
++    registry.register(name=_NAME, toolset="probe-ts", handler=lambda a, **kw: "{}", schema=_td(_NAME)["function"])
++    monkeypatch.setattr(ts, "load_config_readonly", lambda: ts.ToolSearchConfig.from_raw({"eager": [_NAME]}))
++    yield _NAME
++    registry.deregister(_NAME)
++
++
++def test_describe_absent_from_session_names_the_toolset_and_fix(probe_tool):
++    out = json.loads(ts.dispatch_tool_describe({"names": [_NAME]}, current_tool_defs=[]))
++    err = out["errors"][_NAME]
++    assert "NOT enabled in this session" in err
++    assert "hermes tools enable probe-ts --platform cli" in err
++    assert "Call it directly" not in err
++
++
++def test_describe_present_in_session_still_says_call_directly(probe_tool):
++    out = json.loads(ts.dispatch_tool_describe({"names": [_NAME]}, current_tool_defs=[_td(_NAME)]))
++    assert "directly-listed tool" in out["errors"][_NAME]
+diff --git a/tools/tool_search.py b/tools/tool_search.py
+index 0788e97356..44da716040 100644
+--- a/tools/tool_search.py
++++ b/tools/tool_search.py
+@@ -576,8 +576,10 @@ def dispatch_tool_describe(args: dict[str, Any], *, current_tool_defs: list[dict
+             (undescribed if hosted_failure else not_found).append(name)
+         elif _registry_entry(name) is not None and not is_deferrable_tool_name(
+             name, (_cfg := load_config_readonly()).effective_defer_tools, _cfg.eager_tools):
+-            # Registered but bridge/core/GUI-surface: a real name, wrong door.
+-            errors[name] = not_deferrable_error(name)
++            # Registered but bridge/core/GUI-surface: a real name, wrong door — unless it is absent from
++            # this session's schemas (toolset off for the platform), which needs a different fix. [daveey]
++            errors[name] = not_deferrable_error(
++                name, in_session=name in set(_tool_def_names(current_tool_defs)))
+         else:
+             not_found.append(name)
+     result: dict[str, Any] = {"tools": tools}
+diff --git a/tools/tool_search_validation.py b/tools/tool_search_validation.py
+index 5a6e86ae04..3224b9cc9c 100644
+--- a/tools/tool_search_validation.py
++++ b/tools/tool_search_validation.py
+@@ -245,13 +245,24 @@ def local_batch_error(entries: list[dict[str, Any]]) -> str:
+     )
+ 
+ 
+-def not_deferrable_error(name: str) -> str:
++def _not_in_session_error(name: str) -> str:
++    """[daveey] A registered tool whose toolset is off for this session: name the toolset and the fix.
++    Telling the agent 'call it directly' sent it hunting for a tool that is not in its list."""
++    toolset = getattr(_registry_entry(name), "toolset", None) or "?"
++    return (f"'{name}' is registered but NOT enabled in this session: its toolset '{toolset}' is off for this "
++            f"platform. Enable it with `hermes tools enable {toolset} --platform cli` (Desktop and CLI use the "
++            "'cli' platform), then start a new session. The tool was NOT invoked.")
++
++
++def not_deferrable_error(name: str, in_session: bool = True) -> str:
+     """Rejection for a ``tool_call`` naming something that is not a deferred tool.
+     Two different mistakes reach here and need opposite corrections: a directly-listed
+     tool (call it without the bridge) vs. an unknown name — typically a deferred MCP tool
+     cited by its bare suffix instead of the full ``mcp__<server>__{tool}`` name. Telling
+     the second group 'call it directly' is the opposite of what they must do."""
+     from tools.tool_search import _core_tool_names  # late: tool_search imports this module
++    if not in_session and _registry_entry(name) is not None:
++        return _not_in_session_error(name)
+     if name in _core_tool_names() or _registry_entry(name) is not None:
+         return (f"'{name}' is a directly-listed tool, not a deferred one. "
+                 "Call it directly instead of via tool_call. The tool was NOT invoked.")
+-- 
+2.40.0
+

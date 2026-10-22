@@ -1,0 +1,761 @@
+From b3b287ccf034650001902b47811d861cc797c313 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 16:14:06 -0700
+Subject: [PATCH] =?UTF-8?q?feat(agent):=20pre=5Ffinal=5Fgate=20hook=20?=
+ =?UTF-8?q?=E2=80=94=20silent=20stop-gate=20hold,=20append,=20stream=20buf?=
+ =?UTF-8?q?fer=20[daveey]?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A plugin hook that runs on every text stop and can withhold the answer
+without showing or persisting it (unlike pre_verify, whose interim emit
+puts the candidate on screen), or append a note. Bounded by
+agent.pre_final_gate_max (default 2); hook errors/timeouts deliver
+unchanged. needs_buffer=True buffers text deltas for the turn so a held
+answer never streams (no surface can retract streamed text);
+include_background=True opts into kanban workers, subagents and cron.
+---
+ agent/conversation_compression.py         |   2 +-
+ agent/pre_final_gate.py                   | 192 ++++++++++++++++++++
+ agent/session_persistence.py              |   1 +
+ agent/stream_delivery.py                  |  33 +++-
+ agent/turn_context.py                     |   8 +-
+ agent/turn_final_response.py              |   1 +
+ agent/turn_finalizer.py                   |  13 +-
+ agent/turn_stop_gates.py                  |  48 +++++
+ agent/turn_tool_round.py                  |   2 +
+ hermes_cli/config_defaults.py             |   4 +
+ hermes_cli/plugins.py                     |   3 +
+ tests/agent/test_pre_final_gate.py        | 202 ++++++++++++++++++++++
+ website/docs/user-guide/features/hooks.md |  39 +++++
+ 13 files changed, 544 insertions(+), 4 deletions(-)
+ create mode 100644 agent/pre_final_gate.py
+ create mode 100644 tests/agent/test_pre_final_gate.py
+
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 3f2ce36b73..0e8e7eef49 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2223,7 +2223,7 @@ def _message_text(message: Any) -> str:
+ 
+ _SYNTHETIC_USER_FLAGS = (
+     "_todo_snapshot_synthetic", "_empty_recovery_synthetic", "_verification_stop_synthetic", "_pre_verify_synthetic",
+-    "_dropped_toolcall_nudge",
++    "_dropped_toolcall_nudge", "_pre_final_gate_synthetic",
+ )
+ 
+ 
+diff --git a/agent/pre_final_gate.py b/agent/pre_final_gate.py
+new file mode 100644
+index 0000000000..538ae3c774
+--- /dev/null
++++ b/agent/pre_final_gate.py
+@@ -0,0 +1,192 @@
++"""``pre_final_gate`` plugin hook: hold or amend a final text answer before the user sees it. [daveey]
++
++Fires on every text stop (after verify-on-stop, ``pre_verify`` and the kanban guard). Callbacks get
++``session_id, platform, model, final_response, turn_messages, attempt`` (keyword args) and return:
++
++- ``None`` (or anything else) → deliver unchanged.
++- ``{"hold": True, "nudge": str}`` → the candidate is NOT emitted, NOT streamed (see below) and NOT
++  persisted; it is kept only as the budget-exhaustion fallback (``pending_verification_response``).
++  The held row plus the nudge (a synthetic user row) stay in the in-memory turn so the model sees
++  them, and are stripped from the returned/live history at turn end. The turn continues.
++- ``{"append": str}`` → deliver with ``"\\n\\n" + text`` appended.
++
++``attempt`` counts holds already issued this turn. Once it reaches ``agent.pre_final_gate_max``
++(default 2) a hold is downgraded to deliver (its ``append``, if any, is still applied). A callback
++that raises or exceeds ``agent.pre_final_gate_timeout`` seconds (default 30) is logged and ignored.
++
++Callback attributes (set on the function before ``ctx.register_hook``):
++
++- ``needs_buffer = True``: assistant text deltas are buffered for the whole turn while this hook is
++  eligible, and released only when a response turns out to carry tool calls (commentary), when the
++  gate delivers, or at turn end. A held answer is discarded from the buffer, so it never reaches
++  the screen. Neither Desktop nor CLI/gateway streams can retract text already shown, hence the
++  buffer: without it, a held answer that already streamed stays visible.
++- ``include_background = True``: also run in kanban workers, delegate_task subagents and cron jobs
++  (skipped there by default).
++"""
++
++from __future__ import annotations
++
++import concurrent.futures
++import logging
++import os
++from dataclasses import dataclass
++from typing import Any, Callable, Optional
++
++logger = logging.getLogger("agent.conversation_loop")
++
++HOOK = "pre_final_gate"
++FLAG = "_pre_final_gate_synthetic"
++DEFAULT_MAX_ATTEMPTS = 2
++DEFAULT_TIMEOUT_S = 30.0
++
++
++def _agent_cfg() -> dict[str, Any]:
++    try:
++        from hermes_cli.config import load_config
++
++        cfg = load_config().get("agent")
++    except Exception:
++        return {}
++    return cfg if isinstance(cfg, dict) else {}
++
++
++def max_attempts() -> int:
++    """``agent.pre_final_gate_max``: holds allowed per turn before the gate delivers (>= 0)."""
++    try:
++        return max(0, int(_agent_cfg().get("pre_final_gate_max", DEFAULT_MAX_ATTEMPTS)))
++    except (TypeError, ValueError):
++        return DEFAULT_MAX_ATTEMPTS
++
++
++def timeout_s() -> float:
++    try:
++        return max(0.1, float(_agent_cfg().get("pre_final_gate_timeout", DEFAULT_TIMEOUT_S)))
++    except (TypeError, ValueError):
++        return DEFAULT_TIMEOUT_S
++
++
++def is_background_agent(agent: Any) -> bool:
++    """Kanban worker, delegate_task subagent or cron run."""
++    if (getattr(agent, "platform", "") or "") == "cron":
++        return True
++    if (getattr(agent, "_delegate_depth", 0) or 0) > 0:
++        return True
++    if os.environ.get("HERMES_KANBAN_TASK"):
++        try:
++            from agent.delegation_context import is_dispatcher_owned_worker_context
++        except Exception:
++            return True
++        try:
++            return bool(is_dispatcher_owned_worker_context())
++        except Exception:
++            return True
++    return False
++
++
++def eligible_callbacks(agent: Any) -> list[Callable]:
++    """Registered ``pre_final_gate`` callbacks that apply to this agent's context."""
++    try:
++        from hermes_cli.lifecycle import has_hook
++
++        if not has_hook(HOOK):
++            return []
++        from hermes_cli.plugins import iter_hook_callbacks
++
++        callbacks = list(iter_hook_callbacks(HOOK))
++    except Exception:
++        logger.debug("pre_final_gate lookup failed", exc_info=True)
++        return []
++    if callbacks and is_background_agent(agent):
++        callbacks = [cb for cb in callbacks if getattr(cb, "include_background", False)]
++    return callbacks
++
++
++def needs_buffer(agent: Any) -> bool:
++    return any(getattr(cb, "needs_buffer", False) for cb in eligible_callbacks(agent))
++
++
++def _is_real_user_row(msg: Any) -> bool:
++    return (
++        isinstance(msg, dict) and msg.get("role") == "user"
++        and not any(k.startswith("_") and k.endswith(("_synthetic", "_nudge")) and msg.get(k) for k in msg)
++    )
++
++
++def turn_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    """This turn's rows: from the last real (non-synthetic) user message to the end."""
++    for idx in range(len(messages) - 1, -1, -1):
++        if _is_real_user_row(messages[idx]):
++            return list(messages[idx:])
++    return list(messages)
++
++
++@dataclass
++class GateDecision:
++    hold: bool = False
++    nudge: str = ""
++    append: str = ""
++
++
++def _call(cb: Callable, kwargs: dict[str, Any], limit: float) -> Any:
++    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="pre-final-gate")
++    try:
++        return pool.submit(cb, **kwargs).result(timeout=limit)
++    finally:
++        pool.shutdown(wait=False)
++
++
++def evaluate(agent: Any, final_response: Any, messages: list[dict[str, Any]], attempt: int) -> GateDecision:
++    """Run eligible callbacks in registration order. First hold wins (while under the limit);
++    appends from the others accumulate. Never raises."""
++    decision = GateDecision()
++    if not isinstance(final_response, str) or not final_response.strip():
++        return decision
++    callbacks = eligible_callbacks(agent)
++    if not callbacks:
++        return decision
++    limit, can_hold, appends = timeout_s(), attempt < max_attempts(), []
++    kwargs = dict(
++        session_id=getattr(agent, "session_id", None) or "",
++        platform=getattr(agent, "platform", "") or "",
++        model=getattr(agent, "model", "") or "",
++        final_response=final_response,
++        turn_messages=turn_messages(messages),
++        attempt=attempt,
++    )
++    for cb in callbacks:
++        name = getattr(cb, "__qualname__", repr(cb))
++        try:
++            result = _call(cb, kwargs, limit)
++        except concurrent.futures.TimeoutError:
++            logger.warning("pre_final_gate hook %s timed out after %.1fs; delivering", name, limit)
++            continue
++        except Exception:
++            logger.warning("pre_final_gate hook %s raised; delivering unchanged", name, exc_info=True)
++            continue
++        if not isinstance(result, dict):
++            continue
++        nudge = result.get("nudge")
++        if result.get("hold") and isinstance(nudge, str) and nudge.strip():
++            if can_hold:
++                return GateDecision(hold=True, nudge=nudge.strip())
++            logger.info("pre_final_gate hold from %s ignored: limit reached (attempt %d)", name, attempt)
++        extra = result.get("append")
++        if isinstance(extra, str) and extra.strip():
++            appends.append(extra.strip())
++    decision.append = "\n\n".join(appends)
++    return decision
++
++
++__all__ = [
++    "DEFAULT_MAX_ATTEMPTS",
++    "FLAG",
++    "HOOK",
++    "GateDecision",
++    "eligible_callbacks",
++    "evaluate",
++    "is_background_agent",
++    "max_attempts",
++    "needs_buffer",
++    "turn_messages",
++]
+diff --git a/agent/session_persistence.py b/agent/session_persistence.py
+index 92a5772a3b..f715c72f51 100644
+--- a/agent/session_persistence.py
++++ b/agent/session_persistence.py
+@@ -39,6 +39,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
+     "_thinking_prefill",
+     "_verification_stop_synthetic",  # verify-on-stop nudge; the assistant candidate itself is NOT synthetic
+     "_pre_verify_synthetic",
++    "_pre_final_gate_synthetic",  # silent hold: held answer AND its nudge are never persisted [daveey]
+     "_kanban_stop_synthetic",  # kanban worker stop-guard
+     "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
+ )
+diff --git a/agent/stream_delivery.py b/agent/stream_delivery.py
+index c0d921c501..b7b79e0c4f 100644
+--- a/agent/stream_delivery.py
++++ b/agent/stream_delivery.py
+@@ -59,7 +59,7 @@ class StreamDeliveryMixin:
+         self._stream_reasoning_hooks_enabled = None
+ 
+         def deliver(tail: str) -> None:
+-            if tail:
++            if tail and not self._buffer_final_gate_text(tail):
+                 self._deliver_to_stream_callbacks(tail)
+                 self._record_streamed_assistant_text(tail)
+ 
+@@ -200,6 +200,9 @@ class StreamDeliveryMixin:
+         different final summary."""
+         if not isinstance(assistant_msg, dict):
+             return
++        # Interim text is meant to be seen: release any pre_final_gate buffer first so
++        # ``already_streamed`` below reflects what is on screen.
++        self._flush_final_gate_buffer()
+         commentary_parts = self._extract_codex_interim_visible_parts(assistant_msg)
+         # Dedup within this message and against earlier deliveries, first occurrence wins.
+         pending: dict[str, str] = {}
+@@ -328,11 +331,39 @@ class StreamDeliveryMixin:
+                 text = text.lstrip("\n")
+         if not text:
+             return
++        if self._buffer_final_gate_text(text):
++            return
++        self._deliver_stream_text(text)
++
++    def _deliver_stream_text(self, text: str) -> None:
+         delivered = self._deliver_to_stream_callbacks(text)
+         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
+         if delivered:
+             self._record_streamed_assistant_text(text)
+ 
++    # pre_final_gate buffer [daveey]: while a ``needs_buffer`` pre_final_gate hook is eligible this
++    # turn (``_final_gate_buffer`` is a list, set per turn), visible text deltas are held here so a
++    # held answer never reaches the screen. Released on a tool-call response (commentary), when the
++    # gate delivers, or at turn end; discarded on hold. See agent/pre_final_gate.py.
++    def _buffer_final_gate_text(self, text: str) -> bool:
++        buf = getattr(self, "_final_gate_buffer", None)
++        if buf is None:
++            return False
++        buf.append(text)
++        return True
++
++    def _flush_final_gate_buffer(self) -> None:
++        buf = getattr(self, "_final_gate_buffer", None)
++        if buf:
++            text = "".join(buf)
++            buf.clear()
++            self._deliver_stream_text(text)
++
++    def _discard_final_gate_buffer(self) -> None:
++        buf = getattr(self, "_final_gate_buffer", None)
++        if buf:
++            buf.clear()
++
+     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
+         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.
+ 
+diff --git a/agent/turn_context.py b/agent/turn_context.py
+index 70d47a6c2e..c76c50c055 100644
+--- a/agent/turn_context.py
++++ b/agent/turn_context.py
+@@ -612,7 +612,7 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
+     ("_harness_metrics_turn", None),
+     ("_iteration_budget_warning_injected", False),
+     ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
+-    ("_pre_verify_nudges", 0),
++    ("_pre_verify_nudges", 0), ("_pre_final_gate_attempts", 0),
+ )
+ 
+ 
+@@ -622,6 +622,12 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
+         setattr(agent, name, value)
+     agent._turn_failed_file_mutations = {}
+     agent._turn_file_mutation_paths = set()
++    # pre_final_gate stream buffer: a list only while a needs_buffer hook applies this turn.
++    try:
++        from agent.pre_final_gate import needs_buffer
++        agent._final_gate_buffer = [] if needs_buffer(agent) else None
++    except Exception:
++        agent._final_gate_buffer = None
+     agent._tool_guardrails.reset_for_turn()
+     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
+     if callable(_reset_consol):
+diff --git a/agent/turn_final_response.py b/agent/turn_final_response.py
+index 8b0c9b1493..5592fb8995 100644
+--- a/agent/turn_final_response.py
++++ b/agent/turn_final_response.py
+@@ -340,6 +340,7 @@ def finish_text_response(
+     if _sg.continue_turn:
+         final_response = None
+         return _verdict("continue")
++    final_response = _sg.final_response  # a pre_final_gate ``append`` extends it [daveey]
+ 
+     # Plugins rewrite the reply BEFORE it is appended and flushed: SQLite treats a non-blank
+     # assistant row as settled, so a transform after this write would reach the user but never
+diff --git a/agent/turn_finalizer.py b/agent/turn_finalizer.py
+index ecb60b7175..4f2cd54b27 100644
+--- a/agent/turn_finalizer.py
++++ b/agent/turn_finalizer.py
+@@ -25,7 +25,10 @@ from agent.served_model import result_model_fields
+ # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
+ # returned/live history to avoid role-alternation breaks; the assistant response is
+ # real content and is not flagged. (#65919)
+-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
++# ``_pre_final_gate_synthetic`` [daveey] marks BOTH rows of a silent hold (the held answer too).
++_VERIFICATION_CONTINUATION_FLAGS = (
++    "_verification_stop_synthetic", "_pre_verify_synthetic", "_pre_final_gate_synthetic",
++)
+ 
+ _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
+ 
+@@ -531,6 +534,14 @@ def finalize_turn(
+     """Run the post-loop finalization and return the turn ``result`` dict."""
+     from agent.conversation_loop import logger
+ 
++    # pre_final_gate stream buffer [daveey]: release text no gate held (interrupts, error exits),
++    # then stop buffering so the budget summary and post-turn output stream normally.
++    try:
++        agent._flush_final_gate_buffer()
++    except Exception:
++        logger.debug("pre_final_gate buffer flush failed", exc_info=True)
++    agent._final_gate_buffer = None
++
+     final_response, _turn_exit_reason, preserved_verification_fallback, interrupted = _resolve_budget_fallback(
+         agent, final_response=final_response, api_call_count=api_call_count,
+         interrupted=interrupted, failed=failed, messages=messages,
+diff --git a/agent/turn_stop_gates.py b/agent/turn_stop_gates.py
+index a762ca3237..f2c0227a6e 100644
+--- a/agent/turn_stop_gates.py
++++ b/agent/turn_stop_gates.py
+@@ -3,6 +3,8 @@
+ When the model stops with a text answer, three gates may instead append the answer as an
+ interim row plus a synthetic user-role nudge and continue the turn: verify-on-stop (#65919),
+ the ``pre_verify`` plugin hook after code edits, and the kanban worker terminal-tool guard.
++A fourth, the ``pre_final_gate`` hook [daveey], holds the answer silently (never emitted or
++persisted) or appends to it; see ``agent/pre_final_gate.py``.
+ Each keeps the candidate answer as a budget-exhaustion fallback
+ (``pending_verification_response``) and clears ``final_response`` so the finalizer can tell
+ this gate from error exits (#61631). Nothing here imports ``agent.conversation_loop`` at
+@@ -171,8 +173,54 @@ def apply_stop_gates(
+             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
+         )
+         return verdict
++
++    _decision = _pre_final_gate_decision(agent, final_response, messages)
++    if _decision.hold:
++        # Silent hold [daveey]: no interim emit, no flush, buffered deltas dropped. The candidate
++        # survives only as the budget-exhaustion fallback; both rows are ephemeral scaffolding.
++        agent._pre_final_gate_attempts = getattr(agent, "_pre_final_gate_attempts", 0) + 1
++        agent._discard_final_gate_buffer()
++        final_msg["finish_reason"] = "pre_final_gate_hold"
++        final_msg[_PFG_FLAG] = True
++        append_message(messages, final_msg)
++        verdict = _continue(_decision.nudge, _PFG_FLAG)
++        logger.info("pre_final_gate hold issued (attempt %d)", agent._pre_final_gate_attempts)
++        return verdict
++    if _decision.append:
++        final_response = _append_to_final(agent, final_msg, final_response, _decision.append)
++    else:
++        agent._flush_final_gate_buffer()
+     return StopGateVerdict(
+         continue_turn=False, final_response=final_response,
+         pending_verification_response=pending_verification_response,
+         pending_verification_response_previewed=pending_verification_response_previewed,
+     )
++
++
++_PFG_FLAG = "_pre_final_gate_synthetic"
++
++
++def _pre_final_gate_decision(agent, final_response, messages):
++    from agent.pre_final_gate import GateDecision, evaluate
++
++    if getattr(agent, "_interrupt_requested", False):
++        return GateDecision()
++    try:
++        return evaluate(agent, final_response, messages, getattr(agent, "_pre_final_gate_attempts", 0))
++    except Exception:
++        logger.warning("pre_final_gate evaluation failed; delivering", exc_info=True)
++        return GateDecision()
++
++
++def _append_to_final(agent, final_msg, final_response: str, extra: str) -> str:
++    """Deliver with ``extra`` appended: rewrite the row, release the buffer, stream the suffix so
++    streamed text and the final answer still match."""
++    suffix = "\n\n" + extra
++    final_response = final_response.rstrip() + suffix
++    key = "api_content" if final_msg.get("api_content") and not final_msg.get("content") else "content"
++    if isinstance(final_msg.get(key), str):
++        final_msg[key] = final_msg[key].rstrip() + suffix
++    agent._flush_final_gate_buffer()
++    if getattr(agent, "_streamed_assistant_text_parts", None):  # only extend a live stream
++        agent._deliver_stream_text(suffix)
++    return final_response
+diff --git a/agent/turn_tool_round.py b/agent/turn_tool_round.py
+index 412b6cf8a4..701d5d3ed8 100644
+--- a/agent/turn_tool_round.py
++++ b/agent/turn_tool_round.py
+@@ -151,6 +151,8 @@ def run_tool_round(
+ 
+     # A UI must never observe an assistant/tool-call row that is only an in-memory
+     # projection: emit interim commentary after the DB append.
++    # A tool-call response is commentary, never a held final: release buffered text (pre_final_gate).
++    agent._flush_final_gate_buffer()
+     if not duplicate_previous_interim:
+         agent._emit_interim_assistant_message(assistant_msg)
+ 
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index c26bd53c94..afe7c1e5ed 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -216,6 +216,10 @@ DEFAULT_CONFIG = {
+         # Also fire `pre_verify` on turns without file edits (changed_paths=[]), so a plugin can check
+         # any final answer (e.g. a hand-off or an unverified "done"). False = upstream: edits only.
+         "pre_verify_every_turn": False,
++        # [daveey] Max silent `pre_final_gate` holds per turn; the next text stop delivers.
++        "pre_final_gate_max": 2,
++        # [daveey] Seconds one `pre_final_gate` callback may take before it is skipped (delivers).
++        "pre_final_gate_timeout": 30,
+         # Verification closure: after code edits in a workspace, refuse a final answer until fresh
+         # verification evidence exists or the agent explains why it can't check (bounded loop,
+         # passive ledger). False (default) because the nudges proved more noise than signal; true =
+diff --git a/hermes_cli/plugins.py b/hermes_cli/plugins.py
+index a652179cd4..ae2d745783 100644
+--- a/hermes_cli/plugins.py
++++ b/hermes_cli/plugins.py
+@@ -117,6 +117,9 @@ VALID_HOOKS: set[str] = {
+     # {"action": "continue", "message"} (or Claude-Code Stop {"decision": "block", "reason"}) to keep
+     # going; anything else finishes. Bounded by agent.max_verify_nudges.
+     "pre_verify", "pre_api_request", "post_api_request", "api_request_error",
++    # pre_final_gate [daveey]: every text stop, after pre_verify. Return {"hold": True, "nudge"} to
++    # silently withhold the answer and continue, or {"append": str}. Contract: agent/pre_final_gate.py.
++    "pre_final_gate",
+     # pre/post_auxiliary_call: once per physical provider attempt of an auxiliary LLM call
+     # (agent/auxiliary_hooks.py — titling, compression, MoA, vision, approval, ...). Same payload
+     # shape as pre/post_api_request plus ``aux_task``; distinct events so turn-scoped
+diff --git a/tests/agent/test_pre_final_gate.py b/tests/agent/test_pre_final_gate.py
+new file mode 100644
+index 0000000000..66c346a9be
+--- /dev/null
++++ b/tests/agent/test_pre_final_gate.py
+@@ -0,0 +1,202 @@
++"""``pre_final_gate`` hook [daveey]: silent hold / append / limit / exception / scope / buffer."""
++
++import logging
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++
++from agent.pre_final_gate import FLAG
++from agent.session_persistence import _is_ephemeral_scaffolding
++from run_agent import AIAgent
++
++
++def _response(content):
++    message = SimpleNamespace(content=content, tool_calls=None)
++    return SimpleNamespace(
++        choices=[SimpleNamespace(message=message, finish_reason="stop")], model="test/model", usage=None,
++    )
++
++
++@pytest.fixture
++def agent(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
++    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
++    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
++    with (
++        patch("model_tools.get_tool_definitions", return_value=[]),
++        patch("model_tools.check_toolset_requirements", return_value={}),
++        patch("agent.process_bootstrap.OpenAI"),
++    ):
++        instance = AIAgent(
++            session_id="pre-final-gate-test", api_key="test-key", base_url="https://example.invalid/v1",
++            provider="openai-compat", model="test/model", max_iterations=6, quiet_mode=True,
++            skip_context_files=True, skip_memory=True, platform="cli",
++        )
++    instance._cached_system_prompt = "stable test prompt"
++    instance._session_db = None
++    instance.save_trajectories = False
++    instance.compression_enabled = False
++    instance._cleanup_task_resources = lambda *_a, **_kw: None
++    instance._save_trajectory = lambda *_a, **_kw: None
++    return instance
++
++
++class Run:
++    """Scripted model: each call streams its answer through ``_fire_stream_delta`` first."""
++
++    def __init__(self, agent, answers):
++        self.agent, self.answers, self.requests = agent, list(answers), []
++        self.screen, self.interims = [], []
++        agent.stream_delta_callback = lambda d: self.screen.append(d) if isinstance(d, str) else None
++        agent.interim_assistant_callback = lambda text, **_kw: self.interims.append(text)
++        agent._interruptible_api_call = self._call
++        agent._interruptible_streaming_api_call = lambda kw, on_first_delta=None: self._call(kw)
++
++    def _call(self, api_kwargs):
++        self.requests.append(api_kwargs)
++        text = self.answers.pop(0)
++        self.agent._fire_stream_delta(text)
++        return _response(text)
++
++    @property
++    def shown(self):
++        return "".join(self.screen) + "\n".join(self.interims)
++
++
++def _run(agent, hook, prompt="hi"):
++    with (
++        patch("hermes_cli.lifecycle.has_hook", side_effect=lambda name: name == "pre_final_gate"),
++        patch("hermes_cli.plugins.iter_hook_callbacks",
++              side_effect=lambda name: (hook,) if name == "pre_final_gate" else ()),
++        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
++    ):
++        return agent.run_conversation(prompt)
++
++
++def _buffered(fn):
++    fn.needs_buffer = True
++    return fn
++
++
++def test_hold_once_never_shows_or_persists_first_answer(agent):
++    run = Run(agent, ["Needs you: please add the token.", "Done: I minted it myself."])
++    seen = []
++
++    @_buffered
++    def hook(final_response, attempt, turn_messages, **kw):
++        seen.append((attempt, final_response, [dict(m) for m in turn_messages]))
++        return {"hold": True, "nudge": "Check first; do it yourself."} if attempt == 0 else None
++
++    result = _run(agent, hook)
++
++    assert result["final_response"] == "Done: I minted it myself."
++    assert "Needs you" not in run.shown, run.shown
++    assert "Done: I minted it myself." in run.shown
++    assert [a for a, *_ in seen] == [0, 1]
++    # Second call: the model saw its held answer and the private nudge.
++    wire = [m.get("content") for m in run.requests[1]["messages"]]
++    assert "Needs you: please add the token." in wire and "Check first; do it yourself." in wire
++    # Both hold rows are ephemeral (never persisted) and stripped from returned history.
++    held_rows = [m for m in seen[1][2] if m.get(FLAG)]
++    assert [m["role"] for m in held_rows] == ["assistant", "user"]
++    assert all(_is_ephemeral_scaffolding(m) for m in held_rows)
++    assert [m["role"] for m in result["messages"]] == ["user", "assistant"]
++    assert result["messages"][-1]["content"] == "Done: I minted it myself."
++
++
++def test_append_delivers_with_note(agent):
++    run = Run(agent, ["Here is the answer."])
++    result = _run(agent, _buffered(lambda **kw: {"append": "(gate note)"}))
++    assert result["final_response"] == "Here is the answer.\n\n(gate note)"
++    assert run.shown == "Here is the answer.\n\n(gate note)"
++    assert result["messages"][-1]["content"] == "Here is the answer.\n\n(gate note)"
++
++
++def test_hold_limit_then_delivers_with_append(agent):
++    run = Run(agent, ["a1", "a2", "a3"])
++    attempts = []
++
++    @_buffered
++    def hook(attempt, **kw):
++        attempts.append(attempt)
++        return {"hold": True, "nudge": "again", "append": "(judge: still asking)"}
++
++    result = _run(agent, hook)
++    assert attempts == [0, 1, 2]  # default agent.pre_final_gate_max = 2 holds
++    assert len(run.requests) == 3
++    assert result["final_response"] == "a3\n\n(judge: still asking)"
++    assert "a1" not in run.shown and "a2" not in run.shown
++
++
++def test_hook_exception_delivers_unchanged_and_logs(agent, caplog):
++    run = Run(agent, ["plain answer"])
++
++    def hook(**kw):
++        raise RuntimeError("judge down")
++
++    with caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
++        result = _run(agent, _buffered(hook))
++    assert result["final_response"] == "plain answer"
++    assert run.shown == "plain answer"
++    assert len(run.requests) == 1
++    assert any("pre_final_gate hook" in r.getMessage() and "raised" in r.getMessage() for r in caplog.records)
++
++
++def test_skipped_for_subagents_unless_opted_in(agent):
++    agent._delegate_depth = 1
++    calls = []
++
++    def hook(**kw):
++        calls.append(1)
++        return {"append": "x"}
++
++    Run(agent, ["sub answer"])
++    assert _run(agent, hook)["final_response"] == "sub answer" and not calls
++
++    hook.include_background = True
++    Run(agent, ["sub answer"])
++    assert _run(agent, hook)["final_response"] == "sub answer\n\nx" and calls
++
++
++def test_no_hook_streams_live(agent):
++    run = Run(agent, ["streamed"])
++    with patch("hermes_cli.lifecycle.has_hook", return_value=False), \
++            patch("hermes_cli.plugins.invoke_hook", return_value=[]):
++        result = agent.run_conversation("hi")
++    assert result["final_response"] == "streamed" and run.shown == "streamed"
++    assert agent._final_gate_buffer is None
++
++
++def test_buffer_released_by_interim_and_discarded_on_hold(agent):
++    screen = []
++    agent.stream_delta_callback = lambda d: screen.append(d) if isinstance(d, str) else None
++    agent.interim_assistant_callback = lambda *_a, **_kw: None
++    agent._final_gate_buffer = []
++    agent._fire_stream_delta("commentary before tools")
++    assert screen == []
++    agent._emit_interim_assistant_message({"role": "assistant", "content": "commentary before tools"})
++    assert "".join(screen) == "commentary before tools"
++    agent._fire_stream_delta("held answer")
++    agent._discard_final_gate_buffer()
++    agent._flush_final_gate_buffer()
++    assert "held answer" not in "".join(screen)
++
++
++def test_slow_hook_times_out_and_delivers(agent, caplog):
++    import threading
++    release = threading.Event()
++    run = Run(agent, ["fast answer"])
++
++    def hook(**kw):
++        release.wait(5)
++        return {"hold": True, "nudge": "too late"}
++
++    try:
++        with patch("agent.pre_final_gate.timeout_s", return_value=0.2), \
++                caplog.at_level(logging.WARNING, logger="agent.conversation_loop"):
++            result = _run(agent, _buffered(hook))
++    finally:
++        release.set()
++    assert result["final_response"] == "fast answer" and run.shown == "fast answer"
++    assert any("timed out" in r.getMessage() for r in caplog.records)
+diff --git a/website/docs/user-guide/features/hooks.md b/website/docs/user-guide/features/hooks.md
+index ea15a468b9..1472deb461 100644
+--- a/website/docs/user-guide/features/hooks.md
++++ b/website/docs/user-guide/features/hooks.md
+@@ -885,6 +885,45 @@ For standing guidance that should shape the built-in missing-evidence nudge, use
+ 
+ ---
+ 
++### `pre_final_gate`
++
++Fires on **every text stop** (after `pre_verify` and the kanban worker guard) with the answer the agent is about to deliver. Unlike `pre_verify`, a hold is **silent**: the held answer is never shown, never persisted, and never emitted as an interim message. Use it to check an answer before the user sees it (for example, an "ask the user" gate).
++
++**Callback signature:**
++
++```python
++def my_gate(session_id: str, platform: str, model: str, final_response: str,
++            turn_messages: list, attempt: int, **kwargs):
++```
++
++`turn_messages` holds this turn's rows from the last real user message on (tool calls and results included). `attempt` counts holds already issued this turn.
++
++**Return value:**
++
++- `None` — deliver unchanged.
++- `{"hold": True, "nudge": "..."}` — withhold the answer and continue the turn. The nudge goes to the model as a private synthetic user message. The held answer is kept only as the fallback if the iteration budget runs out.
++- `{"append": "..."}` — deliver with `"\n\n" + text` appended.
++
++**Bounded:** `agent.pre_final_gate_max` (default 2) holds per turn. After that a hold is treated as deliver, and its `append` (if any) is still applied. A callback that raises, or runs longer than `agent.pre_final_gate_timeout` seconds (default 30), is logged and the answer is delivered unchanged.
++
++**Scope:** runs in interactive sessions (CLI, TUI, Desktop, messaging gateways). It is skipped in kanban workers, `delegate_task` subagents and cron jobs unless the callback sets `include_background = True`.
++
++**Streaming:** the answer streams to the screen before the gate runs, and no surface can take back text it already shows. A callback that holds should set `needs_buffer = True`. Assistant text is then buffered for the whole turn while the hook applies. It is released when a response turns out to carry tool calls, when the gate delivers, or at turn end, and a held answer is dropped from the buffer. The cost is that answers appear all at once instead of streaming.
++
++```python
++def ask_gate(final_response, attempt, **kwargs):
++    if attempt == 0 and "can you" in final_response.lower():
++        return {"hold": True, "nudge": "Check whether you can do this yourself before asking."}
++    return None
++
++ask_gate.needs_buffer = True
++
++def register(ctx):
++    ctx.register_hook("pre_final_gate", ask_gate)
++```
++
++---
++
+ ### `transform_api_error_classification`
+ 
+ Fires once per failed API call, at the top of `agent/error_classifier.classify_api_error()`, before the built-in pipeline. Provider plugins use it to own their provider's error quirks without core patches. It is behavior-changing (transform family): the returned classification drives retry, compression, credential rotation, and fallback routing.
+-- 
+2.54.0 (Apple Git-157)
+

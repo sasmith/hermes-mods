@@ -1,0 +1,110 @@
+From 813413eebfe900425879c33548c8041d9186b81f Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:37:32 -0700
+Subject: [PATCH] fix(profiles): a clone drops the source's sidebar source
+ lists when root sidebar_profiles excludes it [daveey]
+
+profile create --clone copied default's sessions.interactive_sources into the new profile, where
+it counted as an explicit per-profile choice and overrode the root sessions.sidebar_profiles
+default, so a cloned bot profile's cli/desktop sessions still painted. Strip automated_sources /
+interactive_sources / sidebar_profiles from the clone only when the root list is set and the new
+profile is not on it.
+---
+ hermes_cli/profiles.py                        |  7 +++++
+ hermes_cli/session_listing.py                 | 29 +++++++++++++++++++
+ .../hermes_cli/test_profile_clone_channels.py | 24 +++++++++++++++
+ 3 files changed, 60 insertions(+)
+
+diff --git a/hermes_cli/profiles.py b/hermes_cli/profiles.py
+index 5ccd20fc51..d75b956eb0 100644
+--- a/hermes_cli/profiles.py
++++ b/hermes_cli/profiles.py
+@@ -1445,6 +1445,13 @@ def create_profile(
+             stripped = strip_channel_settings(staging, include_state=clone_all, source_dir=source_dir)
+             if stripped:
+                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
++        if source_dir is not None:
++            # [daveey] a clone must not inherit the source's sidebar source lists, or the root's
++            # sessions.sidebar_profiles default (unlisted profiles start automated) never applies.
++            from hermes_cli.session_listing import strip_inherited_sidebar_policy
++            dropped = strip_inherited_sidebar_policy(staging / "config.yaml", canon, profile_dir.parent.parent)
++            if dropped:
++                logger.info("profile %s: cloned without sidebar source lists %s", canon, dropped)
+         _finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description)
+         os.rename(staging, profile_dir)
+     except BaseException:
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index cbc771bea2..61d04eb391 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -120,6 +120,35 @@ def _store_profile_and_root(hermes_home: str | Path) -> tuple[str, Path]:
+     return "default", Path(hermes_home)
+ 
+ 
++_SIDEBAR_POLICY_KEYS = ("automated_sources", "interactive_sources", "sidebar_profiles")
++
++
++def strip_inherited_sidebar_policy(config_path: Path, profile_name: str, root_home: Path) -> list[str]:
++    """Drop the sidebar source lists a ``profile create --clone`` copied from its source [daveey].
++
++    Only when *root_home*'s ``sessions.sidebar_profiles`` is non-empty and *profile_name* is not on
++    it: otherwise the copied ``interactive_sources`` / ``automated_sources`` would count as the new
++    profile's own explicit choice and override the "unlisted profiles start automated" default.
++    Returns the dotted keys removed (``[]`` when nothing applies)."""
++    sidebar_profiles = _sessions_source_list(root_home, "sidebar_profiles")
++    if not sidebar_profiles or profile_name.lower() in sidebar_profiles or not config_path.is_file():
++        return []
++    from hermes_cli.config import atomic_config_replace, read_user_config_raw
++    raw = read_user_config_raw(config_path)
++    sessions_cfg = raw.get("sessions")
++    if not isinstance(sessions_cfg, dict):
++        return []
++    removed = [k for k in _SIDEBAR_POLICY_KEYS if k in sessions_cfg]
++    if not removed:
++        return []
++    for key in removed:
++        sessions_cfg.pop(key)
++    if not sessions_cfg:
++        raw.pop("sessions")
++    atomic_config_replace(config_path, raw)
++    return [f"sessions.{k}" for k in removed]
++
++
+ def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
+     """``sessions.automated_sources`` + ``sessions.interactive_sources`` from *hermes_home*'s own
+     config.yaml [daveey]: which session sources this profile marks ``automated`` (bot / smoke-test
+diff --git a/tests/hermes_cli/test_profile_clone_channels.py b/tests/hermes_cli/test_profile_clone_channels.py
+index efb937e819..b5c523f959 100644
+--- a/tests/hermes_cli/test_profile_clone_channels.py
++++ b/tests/hermes_cli/test_profile_clone_channels.py
+@@ -281,3 +281,27 @@ def test_clone_all_drops_directory_shaped_channel_state(home):
+     (home / "google_chat_user_tokens" / "u@x.json").write_text("{}", encoding="utf-8")
+     profile_dir = create_profile("full", clone_all=True, no_alias=True)
+     assert not (profile_dir / "google_chat_user_tokens").exists()
++
++
++
++def test_clone_drops_source_sidebar_lists_when_root_lists_sidebar_profiles(home):
++    # [daveey] root sidebar_profiles: [default] -> a clone must not inherit default's own
++    # interactive/automated source lists (they would count as the new profile's explicit choice).
++    cfg = dict(_SOURCE_CONFIG, sessions={"sidebar_profiles": ["default"], "interactive_sources": ["desktop", "cli"],
++                                         "automated_sources": ["x"], "auto_archive": True})
++    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
++    profile_dir = create_profile("newbot", clone_config=True, no_alias=True)
++    sessions = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))["sessions"]
++    assert sessions == {"auto_archive": True}
++    from hermes_cli.session_listing import stamp_automated
++    assert stamp_automated([{"id": "a", "source": "cli"}], profile_dir)[0]["automated"] is True
++    # Source untouched.
++    assert yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))["sessions"]["interactive_sources"]
++
++
++def test_clone_keeps_sidebar_lists_when_root_sets_no_sidebar_profiles(home):
++    cfg = dict(_SOURCE_CONFIG, sessions={"interactive_sources": ["desktop", "cli"]})
++    (home / "config.yaml").write_text(yaml.safe_dump(cfg), encoding="utf-8")
++    profile_dir = create_profile("plain", clone_config=True, no_alias=True)
++    sessions = yaml.safe_load((profile_dir / "config.yaml").read_text(encoding="utf-8"))["sessions"]
++    assert sessions["interactive_sources"] == ["desktop", "cli"]
+-- 
+2.55.0
+

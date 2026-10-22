@@ -1,0 +1,972 @@
+From d121da82d980cce145d77a7b29639ce8f07e9358 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 17:12:32 -0700
+Subject: [PATCH] feat(sidebar): hide automated/test sessions by default +
+ 'Show automated & test sessions' toggle [daveey]
+
+Per-profile sessions.automated_sources (list, "*" = whole store; default []) stamps
+automated: bool on every sidebar row (recents/cron/messaging slices, /api/profiles/sessions,
+/api/sessions, the project tree incl. the all-profiles tree), read under the store's own home.
+The desktop drops those rows from recents, project lanes and messaging sections unless the
+new filter-menu checkbox is on; pinned and blocked/needs-attention rows stay. One predicate
+(store/sidebar-automated.ts) serves the list renderer and Cmd-]/Cmd-[ visible-order stepping.
+---
+ .../src/app/chat/sidebar/filter-menu.tsx      | 11 +++
+ apps/desktop/src/app/chat/sidebar/index.tsx   | 30 ++++++-
+ apps/desktop/src/i18n/ar_chrome.ts            |  1 +
+ apps/desktop/src/i18n/de.ts                   |  1 +
+ apps/desktop/src/i18n/en.ts                   |  1 +
+ apps/desktop/src/i18n/es.ts                   |  1 +
+ apps/desktop/src/i18n/fr.ts                   |  1 +
+ apps/desktop/src/i18n/ja.ts                   |  1 +
+ apps/desktop/src/i18n/ru.ts                   |  1 +
+ apps/desktop/src/i18n/types.ts                |  1 +
+ apps/desktop/src/i18n/zh-hant_chrome.ts       |  1 +
+ apps/desktop/src/i18n/zh.ts                   |  1 +
+ apps/desktop/src/store/layout.ts              | 25 +++++-
+ .../src/store/sidebar-automated.test.ts       | 66 ++++++++++++++++
+ apps/desktop/src/store/sidebar-automated.ts   | 78 +++++++++++++++++++
+ .../src/store/sidebar-visible-order.test.ts   | 48 ++++++++++++
+ .../src/store/sidebar-visible-order.ts        | 25 +++++-
+ apps/desktop/src/types/hermes.ts              |  4 +
+ apps/shared/src/gateway-contract.generated.ts |  1 +
+ apps/shared/src/gateway-contract.openrpc.json |  5 ++
+ hermes_cli/config_defaults.py                 |  4 +
+ hermes_cli/session_listing.py                 | 49 ++++++++++++
+ hermes_cli/web_routers/profiles.py            |  8 +-
+ hermes_cli/web_routers/sessions.py            |  3 +-
+ locales/_keys.desktop.json                    |  1 +
+ .../hermes_cli/test_profiles_sidebar_scope.py | 44 +++++++++++
+ tests/hermes_cli/test_session_listing.py      | 33 ++++++++
+ tui_gateway/contracts/projects_pets.py        |  2 +
+ tui_gateway/methods_projects.py               | 20 ++++-
+ 29 files changed, 451 insertions(+), 16 deletions(-)
+ create mode 100644 apps/desktop/src/store/sidebar-automated.test.ts
+ create mode 100644 apps/desktop/src/store/sidebar-automated.ts
+
+diff --git a/apps/desktop/src/app/chat/sidebar/filter-menu.tsx b/apps/desktop/src/app/chat/sidebar/filter-menu.tsx
+index f5f7c6d92d..7f519e1b67 100644
+--- a/apps/desktop/src/app/chat/sidebar/filter-menu.tsx
++++ b/apps/desktop/src/app/chat/sidebar/filter-menu.tsx
+@@ -45,6 +45,7 @@ import {
+   $sidebarRowMeta,
+   $sidebarShowAllSessions,
+   $sidebarShowArchived,
++  $sidebarShowAutomated,
+   $sidebarStatusFilter,
+   $sidebarViewCustomized,
+   $sidebarWorkspaceNodeOpen,
+@@ -54,6 +55,7 @@ import {
+   setSidebarOrdering,
+   setSidebarShowAllSessions,
+   setSidebarShowArchived,
++  setSidebarShowAutomated,
+   setWorkspaceNodesOpen,
+   SIDEBAR_GROUPING_ORDER,
+   type SidebarGrouping,
+@@ -266,6 +268,7 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
+   const narrowsByProfile = showAllProfiles && profileNames.length > 1
+   const prFilter = useStore($sidebarPrFilter)
+   const showArchived = useStore($sidebarShowArchived)
++  const showAutomated = useStore($sidebarShowAutomated)
+   const filtersActive = useStore($sidebarFiltersActive)
+   const viewCustomized = useStore($sidebarViewCustomized)
+   const nodeOpen = useStore($sidebarWorkspaceNodeOpen)
+@@ -529,6 +532,14 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
+             option={{ id: 'archived', label: f.archived }}
+           />
+ 
++          {/* [daveey] Bot / smoke-test rows (`automated`, per the owning
++              profile's sessions.automated_sources) stay hidden unless on. */}
++          <OptionCheckbox
++            checked={showAutomated}
++            onCheck={() => setSidebarShowAutomated(!showAutomated)}
++            option={{ id: 'automated', label: f.automated }}
++          />
++
+           {/* One way back rather than two near-identical ones: this drops the
+               grouping and sort too, which "clear filters" left behind. */}
+           {viewCustomized && <DropdownMenuItem onSelect={resetSidebarView}>{f.resetToDefaults}</DropdownMenuItem>}
+diff --git a/apps/desktop/src/app/chat/sidebar/index.tsx b/apps/desktop/src/app/chat/sidebar/index.tsx
+index 5acc8b945e..678fa4437a 100644
+--- a/apps/desktop/src/app/chat/sidebar/index.tsx
++++ b/apps/desktop/src/app/chat/sidebar/index.tsx
+@@ -58,6 +58,7 @@ import {
+   $sidebarSessionOrderManual,
+   $sidebarShowAllSessions,
+   $sidebarShowArchived,
++  $sidebarShowAutomated,
+   $sidebarStatusFilter,
+   $sidebarWorkspaceOrderIds,
+   $sidebarWorkspaceParentOrderIds,
+@@ -137,6 +138,7 @@ import { $workingSessionIds } from '@/store/session-states'
+ import { ackAllSessionsRead } from '@/store/session-unread'
+ import { markSessionUnread } from '@/store/session-unread-remote'
+ import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
++import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
+ import { applySidebarNavPrefs, SIDEBAR_NAV_PREFS_AREA } from '@/store/sidebar-nav'
+ import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
+ 
+@@ -469,6 +471,7 @@ export function ChatSidebar({
+   const pullRequests = useStore($pullRequestsByBranch)
+   const filtersActive = useStore($sidebarFiltersActive)
+   const showArchived = useStore($sidebarShowArchived)
++  const showAutomated = useStore($sidebarShowAutomated)
+   const cardRows = useStore($sidebarCardRows)
+   const archivedSessions = useStore($archivedSessions)
+   const dotStates = useStore($sessionDotStateById)
+@@ -649,6 +652,17 @@ export function ChatSidebar({
+         return false
+       }
+ 
++      // [daveey] Bot / test rows leave every list and lane unless shown (pinned
++      // and blocked / needs-input rows stay). Same predicate ⌘] / ⌘[ use.
++      if (
++        sessionHiddenAsAutomated(session, showAutomated, {
++          dotState: dotStates[session.id] ?? 'idle',
++          pinnedIds: pinnedSessionIds
++        })
++      ) {
++        return false
++      }
++
+       if (statusFilter.length && !statusFilter.includes(sessionStatusBucket(dotStates[session.id]))) {
+         return false
+       }
+@@ -675,6 +689,8 @@ export function ChatSidebar({
+     [
+       hiddenGatewayIds,
+       gatewayRegistry,
++      showAutomated,
++      pinnedSessionIds,
+       statusFilter,
+       projectFilter,
+       profileFilter,
+@@ -689,6 +705,7 @@ export function ChatSidebar({
+ 
+   const filtersNarrow =
+     hiddenGatewayIds.length > 0 ||
++    !showAutomated ||
+     statusFilter.length > 0 ||
+     projectFilter.length > 0 ||
+     prFilter.length > 0 ||
+@@ -716,9 +733,18 @@ export function ChatSidebar({
+     [cronSessions, profileScope]
+   )
+ 
++  // [daveey] A bot profile's platform threads (Slack followers…) are
++  // automated too: same predicate as recents and the project lanes.
+   const visibleMessagingSessions = useMemo(
+-    () => filterSessionsByProfileScope(messagingSessions, profileScope),
+-    [messagingSessions, profileScope]
++    () =>
++      filterSessionsByProfileScope(messagingSessions, profileScope).filter(
++        session =>
++          !sessionHiddenAsAutomated(session, showAutomated, {
++            dotState: dotStates[session.id] ?? 'idle',
++            pinnedIds: pinnedSessionIds
++          })
++      ),
++    [messagingSessions, profileScope, showAutomated, dotStates, pinnedSessionIds]
+   )
+ 
+   // Index sessions by every id a pin might be stored under — recents, cron,
+diff --git a/apps/desktop/src/i18n/ar_chrome.ts b/apps/desktop/src/i18n/ar_chrome.ts
+index 8bd0e2d2f0..c7f3a154a9 100644
+--- a/apps/desktop/src/i18n/ar_chrome.ts
++++ b/apps/desktop/src/i18n/ar_chrome.ts
+@@ -172,6 +172,7 @@ export const arChrome = {
+       profile: 'الملف الشخصي',
+       project: 'المشروع',
+       archived: 'مؤرشف',
++      automated: 'إظهار الجلسات الآلية والتجريبية',
+       resetToDefaults: 'إعادة تعيين إلى الافتراضي',
+       expandAll: 'توسيع الكل',
+       collapseAll: 'طي الكل',
+diff --git a/apps/desktop/src/i18n/de.ts b/apps/desktop/src/i18n/de.ts
+index a7d1beb93a..1fd3f6c19e 100644
+--- a/apps/desktop/src/i18n/de.ts
++++ b/apps/desktop/src/i18n/de.ts
+@@ -3679,6 +3679,7 @@ export const deOverrides = {
+       profile: 'Profil',
+       project: 'Projekt',
+       archived: 'Archiviert',
++      automated: 'Automatisierte & Test-Sitzungen anzeigen',
+       resetToDefaults: 'Auf Standard zurücksetzen',
+       expandAll: 'Alle ausklappen',
+       collapseAll: 'Alle einklappen',
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index ecc05197cc..c6f731878e 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3241,6 +3241,7 @@ export const en: Translations = {
+       profile: 'Profile',
+       project: 'Project',
+       archived: 'Archived',
++      automated: 'Show automated & test sessions',
+       resetToDefaults: 'Reset to defaults',
+       expandAll: 'Expand all',
+       collapseAll: 'Collapse all',
+diff --git a/apps/desktop/src/i18n/es.ts b/apps/desktop/src/i18n/es.ts
+index e04416036d..251985ded4 100644
+--- a/apps/desktop/src/i18n/es.ts
++++ b/apps/desktop/src/i18n/es.ts
+@@ -3673,6 +3673,7 @@ export const esOverrides = {
+       profile: 'Perfil',
+       project: 'Proyecto',
+       archived: 'Archivados',
++      automated: 'Mostrar sesiones automatizadas y de prueba',
+       resetToDefaults: 'Restablecer valores predeterminados',
+       expandAll: 'Expandir todo',
+       collapseAll: 'Contraer todo',
+diff --git a/apps/desktop/src/i18n/fr.ts b/apps/desktop/src/i18n/fr.ts
+index c28180be35..b90e1ab1c1 100644
+--- a/apps/desktop/src/i18n/fr.ts
++++ b/apps/desktop/src/i18n/fr.ts
+@@ -3688,6 +3688,7 @@ export const frOverrides = {
+       profile: 'Profil',
+       project: 'Projet',
+       archived: 'Archivées',
++      automated: 'Afficher les sessions automatisées et de test',
+       resetToDefaults: 'Rétablir les valeurs par défaut',
+       expandAll: 'Tout déplier',
+       collapseAll: 'Tout replier',
+diff --git a/apps/desktop/src/i18n/ja.ts b/apps/desktop/src/i18n/ja.ts
+index 6f5cc73e9d..bd2c0ea603 100644
+--- a/apps/desktop/src/i18n/ja.ts
++++ b/apps/desktop/src/i18n/ja.ts
+@@ -2264,6 +2264,7 @@ export const jaOverrides = {
+       profile: 'プロファイル',
+       project: 'プロジェクト',
+       archived: 'アーカイブ',
++      automated: '自動・テストセッションを表示',
+       resetToDefaults: 'デフォルトに戻す',
+       expandAll: 'すべて展開',
+       collapseAll: 'すべて折りたたむ',
+diff --git a/apps/desktop/src/i18n/ru.ts b/apps/desktop/src/i18n/ru.ts
+index fcd8ad9f74..b9fef00cd9 100644
+--- a/apps/desktop/src/i18n/ru.ts
++++ b/apps/desktop/src/i18n/ru.ts
+@@ -2537,6 +2537,7 @@ export const ruOverrides = {
+       profile: 'Профиль',
+       project: 'Проект',
+       archived: 'Архивные',
++      automated: 'Показывать автоматические и тестовые сессии',
+       expandAll: 'Развернуть все',
+       collapseAll: 'Свернуть все',
+       updated: 'Обновление',
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 430b285baa..11a472da28 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2821,6 +2821,7 @@ export interface Translations extends NoticeTranslations {
+       profile: string
+       project: string
+       archived: string
++      automated: string
+       resetToDefaults: string
+       expandAll: string
+       collapseAll: string
+diff --git a/apps/desktop/src/i18n/zh-hant_chrome.ts b/apps/desktop/src/i18n/zh-hant_chrome.ts
+index f3068766e9..5ee89c441e 100644
+--- a/apps/desktop/src/i18n/zh-hant_chrome.ts
++++ b/apps/desktop/src/i18n/zh-hant_chrome.ts
+@@ -53,6 +53,7 @@ export const zhHantChrome = {
+       profile: '設定檔',
+       project: '專案',
+       archived: '已封存',
++      automated: '顯示自動化與測試工作階段',
+       resetToDefaults: '重設為預設值',
+       expandAll: '全部展開',
+       collapseAll: '全部收合',
+diff --git a/apps/desktop/src/i18n/zh.ts b/apps/desktop/src/i18n/zh.ts
+index e2fa4e1e4f..afda7d8fec 100644
+--- a/apps/desktop/src/i18n/zh.ts
++++ b/apps/desktop/src/i18n/zh.ts
+@@ -3140,6 +3140,7 @@ export const zhOverrides = {
+       profile: '配置档案',
+       project: '项目',
+       archived: '已归档',
++      automated: '显示自动化和测试会话',
+       resetToDefaults: '重置为默认',
+       expandAll: '全部展开',
+       collapseAll: '全部折叠',
+diff --git a/apps/desktop/src/store/layout.ts b/apps/desktop/src/store/layout.ts
+index 0bb0c51bc7..d7a31e9a7c 100644
+--- a/apps/desktop/src/store/layout.ts
++++ b/apps/desktop/src/store/layout.ts
+@@ -61,6 +61,7 @@ const SIDEBAR_CARD_ROWS_STORAGE_KEY = 'hermes.desktop.sidebarCardRows'
+ const SIDEBAR_SHOW_ALL_SESSIONS_STORAGE_KEY = 'hermes.desktop.sidebarShowAllSessions'
+ const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarStatusFilter'
+ const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
++const SIDEBAR_SHOW_AUTOMATED_STORAGE_KEY = 'hermes.desktop.sidebarShowAutomated'
+ const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
+ const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProfileFilter'
+ const SIDEBAR_PR_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarPrFilter'
+@@ -373,6 +374,12 @@ function sameRowMeta(a: SidebarRowMeta[], b: SidebarRowMeta[]): boolean {
+ // flag both filters the list and drives the fetch.
+ export const $sidebarShowArchived = persistentAtom(SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY, false, Codecs.bool)
+ 
++// [daveey] Rows the backend stamps `automated` (the owning profile's
++// `sessions.automated_sources`: bot / smoke-test traffic) stay out of the
++// sidebar unless this is on. Off is the shipped view, so only ON counts as a
++// filter (see `$sidebarFiltersActive`). Predicate: store/sidebar-automated.ts.
++export const $sidebarShowAutomated = persistentAtom(SIDEBAR_SHOW_AUTOMATED_STORAGE_KEY, false, Codecs.bool)
++
+ export const $sidebarStatusFilter = persistentAtom<SessionStatusBucket[]>(
+   SIDEBAR_STATUS_FILTER_STORAGE_KEY,
+   [],
+@@ -417,9 +424,16 @@ export const $sidebarOrdering: ReadableAtom<SidebarOrdering> = computed(
+ )
+ 
+ export const $sidebarFiltersActive: ReadableAtom<boolean> = computed(
+-  [$sidebarStatusFilter, $sidebarProjectFilter, $sidebarProfileFilter, $sidebarPrFilter, $sidebarShowArchived],
+-  (statuses, projects, profiles, prs, archived) =>
+-    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || archived
++  [
++    $sidebarStatusFilter,
++    $sidebarProjectFilter,
++    $sidebarProfileFilter,
++    $sidebarPrFilter,
++    $sidebarShowArchived,
++    $sidebarShowAutomated
++  ],
++  (statuses, projects, profiles, prs, archived, automated) =>
++    statuses.length > 0 || projects.length > 0 || profiles.length > 0 || prs.length > 0 || archived || automated
+ )
+ 
+ /** Anything at all moved off the shipped view — what makes a reset worth
+@@ -899,6 +913,10 @@ export function setSidebarShowArchived(show: boolean) {
+   $sidebarShowArchived.set(show)
+ }
+ 
++export function setSidebarShowAutomated(show: boolean) {
++  $sidebarShowAutomated.set(show)
++}
++
+ function toggleIn<T extends string>($atom: WritableAtom<T[]>, value: T) {
+   const current = $atom.get()
+ 
+@@ -931,6 +949,7 @@ function clearSidebarFilters() {
+   $sidebarProfileFilter.set([])
+   $sidebarPrFilter.set([])
+   $sidebarShowArchived.set(false)
++  $sidebarShowAutomated.set(false)
+ }
+ 
+ /** Every knob the filter menu owns, back to the sidebar as it ships. Ordering
+diff --git a/apps/desktop/src/store/sidebar-automated.test.ts b/apps/desktop/src/store/sidebar-automated.test.ts
+new file mode 100644
+index 0000000000..5b1d897474
+--- /dev/null
++++ b/apps/desktop/src/store/sidebar-automated.test.ts
+@@ -0,0 +1,66 @@
++import { afterEach, describe, expect, it } from 'vitest'
++
++import { $pinnedSessionIds, $sidebarFiltersActive, $sidebarShowAutomated, resetSidebarView } from './layout'
++import { $blockedSessionIds } from './session-blocked'
++import { sessionHiddenAsAutomated } from './sidebar-automated'
++
++const bot = { automated: true, id: 'bot', message_count: 3 }
++const human = { automated: false, id: 'human', message_count: 3 }
++const legacy = { id: 'legacy', message_count: 3 } // backend predating the stamp
++
++afterEach(() => {
++  $sidebarShowAutomated.set(false)
++  $pinnedSessionIds.set([])
++  $blockedSessionIds.set([])
++})
++
++describe('sessionHiddenAsAutomated [daveey]', () => {
++  it('hides automated rows when the toggle is off, never human or unstamped rows', () => {
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'idle' })).toBe(true)
++    expect(sessionHiddenAsAutomated(human, false, { dotState: 'idle' })).toBe(false)
++    expect(sessionHiddenAsAutomated(legacy, false, { dotState: 'idle' })).toBe(false)
++  })
++
++  it('shows automated rows when the toggle is on', () => {
++    expect(sessionHiddenAsAutomated(bot, true, { dotState: 'idle' })).toBe(false)
++    $sidebarShowAutomated.set(true)
++    expect(sessionHiddenAsAutomated(bot)).toBe(false)
++  })
++
++  it('keeps pinned automated rows (server flag, local pin, or lineage-root pin)', () => {
++    expect(sessionHiddenAsAutomated({ ...bot, pinned: true }, false, { dotState: 'idle' })).toBe(false)
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'idle', pinnedIds: ['bot'] })).toBe(false)
++    expect(
++      sessionHiddenAsAutomated({ ...bot, _lineage_root_id: 'root' }, false, { dotState: 'idle', pinnedIds: ['root'] })
++    ).toBe(false)
++    $pinnedSessionIds.set(['bot'])
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'idle' })).toBe(false)
++  })
++
++  it('keeps automated rows that are blocked or need attention', () => {
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'needs-input' })).toBe(false)
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'stalled' })).toBe(false)
++    expect(sessionHiddenAsAutomated({ ...bot, kanban_blocked: 1 }, false, { dotState: 'idle' })).toBe(false)
++    expect(sessionHiddenAsAutomated({ ...bot, review_wait: 'stuck' }, false, { dotState: 'idle' })).toBe(false)
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'idle', userBlocked: true })).toBe(false)
++    $blockedSessionIds.set(['bot'])
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'idle' })).toBe(false)
++  })
++
++  it('still hides a working or finished automated row', () => {
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'working' })).toBe(true)
++    expect(sessionHiddenAsAutomated(bot, false, { dotState: 'unread' })).toBe(true)
++  })
++})
++
++describe('$sidebarShowAutomated', () => {
++  it('defaults off without lighting the filter dot; on counts as a filter; reset turns it off', () => {
++    expect($sidebarShowAutomated.get()).toBe(false)
++    expect($sidebarFiltersActive.get()).toBe(false)
++    $sidebarShowAutomated.set(true)
++    expect($sidebarFiltersActive.get()).toBe(true)
++    resetSidebarView()
++    expect($sidebarShowAutomated.get()).toBe(false)
++    expect($sidebarFiltersActive.get()).toBe(false)
++  })
++})
+diff --git a/apps/desktop/src/store/sidebar-automated.ts b/apps/desktop/src/store/sidebar-automated.ts
+new file mode 100644
+index 0000000000..94d9f37c57
+--- /dev/null
++++ b/apps/desktop/src/store/sidebar-automated.ts
+@@ -0,0 +1,78 @@
++import type { SessionInfo } from '@/types/hermes'
++
++import { $pinnedSessionIds, $sidebarShowAutomated } from './layout'
++import { isSessionBlocked } from './session-blocked'
++import { $sessionDotStateById, type SessionDotState, sessionStatusStripe } from './session-dot-state'
++
++/**
++ * [daveey] Automated / test sessions in the sidebar.
++ *
++ * The backend stamps `automated: true` on rows whose source matches the owning
++ * profile's `sessions.automated_sources` (`"*"` = the whole profile: bot
++ * profiles, Slack followers, smoke tests). The sidebar drops those rows unless
++ * "Show automated & test sessions" is on — except a row that still wants the
++ * user: pinned, or painting a blocked / needs-attention (red or grey) stripe.
++ *
++ * ONE predicate: the sidebar list/tree filter and ⌘] / ⌘[ visible-order
++ * stepping both call {@link sessionHiddenAsAutomated}, never a copy.
++ */
++
++type AutomatedRow = Pick<
++  SessionInfo,
++  | '_lineage_root_id'
++  | 'automated'
++  | 'cron_active'
++  | 'id'
++  | 'kanban_blocked'
++  | 'message_count'
++  | 'pinned'
++  | 'review_wait'
++>
++
++export interface AutomatedRowContext {
++  /** Dot state for the row; defaults to `$sessionDotStateById`. */
++  dotState?: SessionDotState
++  /** Local pin ids; defaults to `$pinnedSessionIds`. */
++  pinnedIds?: readonly string[]
++  /** ⌘B parked flag; defaults to `isSessionBlocked(row.id)`. */
++  userBlocked?: boolean
++}
++
++/** A bot row that is waiting on the user: needs input, or a red / grey stripe. */
++export function automatedRowNeedsAttention(row: AutomatedRow, state: SessionDotState, userBlocked: boolean): boolean {
++  if (state === 'needs-input' || state === 'stalled') {
++    return true
++  }
++
++  const stripe = sessionStatusStripe(
++    state,
++    (row.message_count ?? 0) > 0,
++    userBlocked,
++    row.kanban_blocked ?? 0,
++    row.cron_active === true,
++    row.review_wait
++  )
++
++  return stripe === 'stuck' || stripe === 'blocked'
++}
++
++export function sessionHiddenAsAutomated(
++  row: AutomatedRow,
++  showAutomated: boolean = $sidebarShowAutomated.get(),
++  ctx: AutomatedRowContext = {}
++): boolean {
++  if (showAutomated || row.automated !== true || row.pinned === true) {
++    return false
++  }
++
++  const pins = ctx.pinnedIds ?? $pinnedSessionIds.get()
++
++  if (pins.includes(row.id) || (row._lineage_root_id != null && pins.includes(row._lineage_root_id))) {
++    return false
++  }
++
++  const state = ctx.dotState ?? $sessionDotStateById.get()[row.id] ?? 'idle'
++  const userBlocked = ctx.userBlocked ?? isSessionBlocked(row.id)
++
++  return !automatedRowNeedsAttention(row, state, userBlocked)
++}
+diff --git a/apps/desktop/src/store/sidebar-visible-order.test.ts b/apps/desktop/src/store/sidebar-visible-order.test.ts
+index 53c0d5d19b..7a66abf72c 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.test.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.test.ts
+@@ -14,6 +14,8 @@ vi.mock('@/store/session-dot-state', async importOriginal => {
+   return { ...real, $sessionDotStateById: $dots }
+ })
+ 
++import { $sidebarShowAutomated } from './layout'
++import { $sessions } from './session'
+ import { $blockedSessionIds, toggleSessionBlocked } from './session-blocked'
+ import {
+   nextSidebarSessionId,
+@@ -209,3 +211,49 @@ describe('nextSidebarSessionId (⌘] / ⌘[)', () => {
+     expect(nextSidebarSessionId('p1', -1, false)).toBe('p5')
+   })
+ })
++
++describe('automated / test rows (sessions.automated_sources) [daveey]', () => {
++  const key = Symbol('recents')
++
++  afterEach(() => {
++    unpublishSidebarSection(key)
++    dots.value = {}
++    $sessions.set([])
++    $sidebarShowAutomated.set(false)
++    document.body.innerHTML = ''
++  })
++
++  // a, c: green human rows; b: green automated row (hidden by default).
++  function setup() {
++    const anchor = document.createElement('span')
++    document.body.append(anchor)
++    publishSidebarSection(key, { anchor, ids: ['a', 'b', 'c'], turnIds: ['a', 'b', 'c'], virtualized: true })
++    dots.value = { a: 'idle', b: 'idle', c: 'idle' }
++    $sessions.set([
++      { id: 'a', message_count: 2 },
++      { automated: true, id: 'b', message_count: 2 },
++      { id: 'c', message_count: 2 }
++    ] as never)
++  }
++
++  it('drops hidden automated rows from the visible order, and stepping skips them', () => {
++    setup()
++    expect(sidebarSessionOrder()).toEqual(['a', 'c'])
++    expect(nextSidebarSessionId('a', 1, false)).toBe('c')
++    expect(nextSidebarSessionId('a', 1, true)).toBe('c')
++  })
++
++  it('steps onto them again once "Show automated & test sessions" is on', () => {
++    setup()
++    $sidebarShowAutomated.set(true)
++    expect(sidebarSessionOrder()).toEqual(['a', 'b', 'c'])
++    expect(nextSidebarSessionId('a', 1, false)).toBe('b')
++  })
++
++  it('keeps an automated row that needs the user (red stripe) in the order', () => {
++    setup()
++    dots.value = { a: 'idle', b: 'needs-input', c: 'idle' }
++    expect(sidebarSessionOrder()).toEqual(['a', 'b', 'c'])
++    expect(nextSidebarSessionId('a', 1, false)).toBe('b')
++  })
++})
+diff --git a/apps/desktop/src/store/sidebar-visible-order.ts b/apps/desktop/src/store/sidebar-visible-order.ts
+index 4224d74ca7..15624f00d6 100644
+--- a/apps/desktop/src/store/sidebar-visible-order.ts
++++ b/apps/desktop/src/store/sidebar-visible-order.ts
+@@ -1,6 +1,7 @@
+-import { $sessions } from '@/store/session'
++import { $messagingSessions, $sessions } from '@/store/session'
+ import { isSessionBlocked } from '@/store/session-blocked'
+ import { $sessionDotStateById, sessionStatusStripe } from '@/store/session-dot-state'
++import { sessionHiddenAsAutomated } from '@/store/sidebar-automated'
+ 
+ // The sidebar's session order as the user sees it, for ⌘] / ⌘[ stepping.
+ // Each rendered SessionsSection (pinned, recents, …) publishes the ids of its
+@@ -58,6 +59,16 @@ function domOrder(a: SectionEntry, b: SectionEntry): number {
+   return a.anchor.compareDocumentPosition(b.anchor) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+ }
+ 
++/** [daveey] Whether the sidebar keeps this id out as automated / test traffic
++ *  (store/sidebar-automated.ts — the predicate the list renderer filters by).
++ *  A virtualized section's row model and the recency fallback are not
++ *  DOM-filtered, so stepping must apply it itself. */
++function hiddenAsAutomated(id: string): boolean {
++  const row = $sessions.get().find(s => s.id === id) ?? $messagingSessions.get().find(s => s.id === id)
++
++  return row ? sessionHiddenAsAutomated(row) : false
++}
++
+ /** Visible sidebar session ids, top to bottom (deduped). Falls back to the
+  *  recency list when no section is mounted (sidebar hidden, project view). */
+ export function sidebarSessionOrder(): string[] {
+@@ -69,12 +80,20 @@ export function sidebarSessionOrder(): string[] {
+     for (const id of sectionIds(entry)) {
+       if (!seen.has(id)) {
+         seen.add(id)
+-        ids.push(id)
++
++        if (!hiddenAsAutomated(id)) {
++          ids.push(id)
++        }
+       }
+     }
+   }
+ 
+-  return ids.length ? ids : $sessions.get().map(session => session.id)
++  return ids.length
++    ? ids
++    : $sessions
++        .get()
++        .filter(session => !sessionHiddenAsAutomated(session))
++        .map(session => session.id)
+ }
+ 
+ /** Whether a sidebar row shows a coloured status stripe — green (finished,
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 56154e6cd9..25641f911a 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -666,6 +666,10 @@ export interface SessionInfo {
+   review_wait?: 'parked' | 'stuck'
+   /** [daveey] The PR `review_wait` refers to. */
+   review_wait_pr?: string
++  /** [daveey] The owning profile's `sessions.automated_sources` matched this
++   *  row (bot / smoke-test traffic). Hidden from the sidebar unless "Show
++   *  automated & test sessions" is on; see store/sidebar-automated.ts. */
++  automated?: boolean
+   preview: null | string
+   source: null | string
+   started_at: number
+diff --git a/apps/shared/src/gateway-contract.generated.ts b/apps/shared/src/gateway-contract.generated.ts
+index f21df4ffb9..58d37d18e7 100644
+--- a/apps/shared/src/gateway-contract.generated.ts
++++ b/apps/shared/src/gateway-contract.generated.ts
+@@ -2596,6 +2596,7 @@ export interface ProjectTreeSession {
+   _lineage_ids?: string[] | null
+   continuation_kind?: string | null
+   profile?: string | null
++  automated?: boolean
+   [key: string]: unknown
+ }
+ export interface ProjectsProjectSessionsParams {
+diff --git a/apps/shared/src/gateway-contract.openrpc.json b/apps/shared/src/gateway-contract.openrpc.json
+index afce075318..8af159e75f 100644
+--- a/apps/shared/src/gateway-contract.openrpc.json
++++ b/apps/shared/src/gateway-contract.openrpc.json
+@@ -26302,6 +26302,11 @@
+             ],
+             "default": null,
+             "title": "Profile"
++          },
++          "automated": {
++            "default": false,
++            "title": "Automated",
++            "type": "boolean"
+           }
+         },
+         "required": [
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index afe7c1e5ed..8baa358e58 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2338,6 +2338,10 @@ DEFAULT_CONFIG = {
+         # (cron/kanban/oneshot are always out). For machine profiles whose sessions are app
+         # traffic, e.g. ["api_server"] on a profile serving another app's LLM calls. [daveey]
+         "sidebar_exclude_sources": [],
++        # Session sources this profile marks `automated` (bot / smoke-test traffic): the desktop
++        # sidebar hides those rows unless "Show automated & test sessions" is on (pinned and
++        # blocked / needs-input rows stay). "*" = every session in this profile. [daveey]
++        "automated_sources": [],
+         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
+         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
+         # deleted AND freelist/page_count > 25%.
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index a00b1fc381..8c2abe97c1 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -54,6 +54,55 @@ def sidebar_excluded_sources(hermes_home: str | Path) -> list[str]:
+     return [str(s).strip() for s in raw if str(s).strip()]
+ 
+ 
++AUTOMATED_ALL_SOURCES = "*"
++
++
++def automated_session_sources(hermes_home: str | Path) -> list[str]:
++    """``sessions.automated_sources`` from *hermes_home*'s own config.yaml [daveey]: session sources
++    this profile marks ``automated`` (bot / smoke-test traffic the desktop sidebar hides unless
++    "Show automated & test sessions" is on). ``"*"`` marks every session in the store. Like
++    ``sidebar_exclude_sources`` the store's home decides, never the process ``HERMES_HOME``.
++    ``[]`` when unset or unreadable."""
++    from hermes_cli.config import load_config_readonly
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    token = set_hermes_home_override(str(hermes_home))
++    try:
++        sessions_cfg = load_config_readonly().get("sessions") or {}
++    except Exception:
++        return []
++    finally:
++        reset_hermes_home_override(token)
++    raw = sessions_cfg.get("automated_sources") if isinstance(sessions_cfg, dict) else None
++    if isinstance(raw, str):
++        raw = raw.split(",")
++    if not isinstance(raw, (list, tuple)):
++        return []
++    return [str(s).strip().lower() for s in raw if str(s).strip()]
++
++
++def is_automated_source(source: Any, automated_sources: list[str]) -> bool:
++    """Whether a row with *source* is automated under *automated_sources* (``"*"`` = all)."""
++    if not automated_sources:
++        return False
++    if AUTOMATED_ALL_SOURCES in automated_sources:
++        return True
++    return str(source or "").strip().lower() in automated_sources
++
++
++def stamp_automated(
++    rows: list[dict[str, Any]], hermes_home: str | Path | None = None, *,
++    automated_sources: list[str] | None = None,
++) -> list[dict[str, Any]]:
++    """Set ``automated: bool`` on every row from its store's ``sessions.automated_sources``
++    (read from *hermes_home* unless *automated_sources* is given). Returns *rows*."""
++    if automated_sources is None:
++        automated_sources = automated_session_sources(hermes_home) if hermes_home is not None else []
++    for row in rows:
++        row["automated"] = is_automated_source(row.get("source"), automated_sources)
++    return rows
++
++
+ def subagent_listing_scope(
+     hermes_home: str | Path, *, source: str | None = None, sources: list[str] | None = None,
+     exclude_sources: list[str] | None = None,
+diff --git a/hermes_cli/web_routers/profiles.py b/hermes_cli/web_routers/profiles.py
+index 63161f3171..ab35809137 100644
+--- a/hermes_cli/web_routers/profiles.py
++++ b/hermes_cli/web_routers/profiles.py
+@@ -28,7 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
+ 
+ from fastapi import APIRouter, HTTPException, Query
+ 
+-from hermes_cli.session_listing import subagent_listing_scope
++from hermes_cli.session_listing import automated_session_sources, stamp_automated, subagent_listing_scope
+ from hermes_cli.web_deps import late
+ from hermes_cli.config import get_process_hermes_home
+ from hermes_cli.profiles import ProfileIdentitySettlementPending
+@@ -503,7 +503,7 @@ def get_profiles_sessions(
+                 # Same SQL-level blob skip as /api/sessions.
+                 compact_rows=not full, include_pinned=True, **scoped)
+             totals[name] = db.session_count(exclude_children=True, **scoped)
+-            merged.extend(_tag_rows(rows, name, now))
++            merged.extend(stamp_automated(_tag_rows(rows, name, now), home))
+         _read_profile_db(name, home, errors, _read)
+ 
+     sort_key = "last_active" if order == "recent" else "started_at"
+@@ -612,8 +612,10 @@ def get_profiles_sessions_sidebar(
+         # fake a full page (#81484).
+         recents_truncated[name] = len(slices["recents"]) >= cap["recents"]
+         profile_totals[name] = slices["usage"]
++        automated = automated_session_sources(home)
+         for key in slice_scope:
+-            rows[key].extend(_tag_rows(slices[key], name, now))
++            rows[key].extend(stamp_automated(
++                _tag_rows(slices[key], name, now), automated_sources=automated))
+ 
+     def _window(key: str) -> list[dict[str, Any]]:
+         rows[key].sort(key=_recency, reverse=True)
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 223c0212a1..9dcfc2dde0 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -18,7 +18,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
+ from fastapi.encoders import jsonable_encoder
+ from fastapi.responses import StreamingResponse
+ 
+-from hermes_cli.session_listing import subagent_listing_scope
++from hermes_cli.session_listing import stamp_automated, subagent_listing_scope
+ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+@@ -246,6 +246,7 @@ def get_sessions(
+                 # SQLite stores the flags as 0/1; expose real JSON booleans.
+                 s["archived"] = bool(s.get("archived"))
+                 s["pinned"] = bool(s.get("pinned"))
++            stamp_automated(sessions, Path(db.db_path).parent)
+             if not full:
+                 _strip_session_list_rows(sessions)
+             annotate_kanban_activity(sessions)
+diff --git a/locales/_keys.desktop.json b/locales/_keys.desktop.json
+index 2f5320d76c..fc8a8b43c4 100644
+--- a/locales/_keys.desktop.json
++++ b/locales/_keys.desktop.json
+@@ -4247,6 +4247,7 @@
+     "sidebar.dateDivider.yesterday",
+     "sidebar.files",
+     "sidebar.filter.archived",
++    "sidebar.filter.automated",
+     "sidebar.filter.closed",
+     "sidebar.filter.collapseAll",
+     "sidebar.filter.cost",
+diff --git a/tests/hermes_cli/test_profiles_sidebar_scope.py b/tests/hermes_cli/test_profiles_sidebar_scope.py
+index a3203fa916..750805145d 100644
+--- a/tests/hermes_cli/test_profiles_sidebar_scope.py
++++ b/tests/hermes_cli/test_profiles_sidebar_scope.py
+@@ -142,6 +142,50 @@ class TestSidebarScope:
+         assert {row["profile"] for row in payload["messaging"]["sessions"]} == {"default", "worker"}
+ 
+ 
++class TestAutomatedSessions:
++    """[daveey] ``sessions.automated_sources`` stamps ``automated`` per profile on every sidebar
++    payload (recents/messaging slices, the unified list, the project tree); unset = all False."""
++
++    @pytest.fixture
++    def seeded(self, profiles_on_disk):
++        (profiles_on_disk["worker"] / "config.yaml").write_text(
++            "sessions:\n  automated_sources: ['*']\n", encoding="utf-8")
++        _seed_session(profiles_on_disk["worker"], "worker-chat", source="cli")
++        _seed_session(profiles_on_disk["worker"], "worker-slack", source="slack")
++        _seed_session(profiles_on_disk["default"], "default-chat", source="cli")
++        return profiles_on_disk
++
++    def test_sidebar_slices_flag_only_the_flagged_profile(self, client, seeded):
++        payload = client.get(
++            "/api/profiles/sessions/sidebar",
++            params={"recents_profile": "all", "recents_exclude": "slack", "messaging_exclude": "cli,cron"},
++        ).json()
++        recents = {r["id"]: r["automated"] for r in payload["recents"]["sessions"]}
++        messaging = {r["id"]: r["automated"] for r in payload["messaging"]["sessions"]}
++        assert recents == {"worker-chat": True, "default-chat": False}
++        assert messaging == {"worker-slack": True}
++
++    def test_unified_list_flags_rows(self, client, seeded):
++        rows = client.get("/api/profiles/sessions", params={"limit": 50}).json()["sessions"]
++        assert {r["id"]: r["automated"] for r in rows} == {
++            "worker-chat": True, "worker-slack": True, "default-chat": False}
++
++    def test_listed_source_only(self, client, profiles_on_disk):
++        (profiles_on_disk["worker"] / "config.yaml").write_text(
++            "sessions:\n  automated_sources: [slack]\n", encoding="utf-8")
++        _seed_session(profiles_on_disk["worker"], "worker-chat", source="cli")
++        _seed_session(profiles_on_disk["worker"], "worker-slack", source="slack")
++        rows = client.get("/api/profiles/sessions", params={"limit": 50}).json()["sessions"]
++        assert {r["id"]: r["automated"] for r in rows} == {"worker-chat": False, "worker-slack": True}
++
++    def test_project_tree_rows_flagged_per_profile(self, client, seeded):
++        payload = client.get("/api/profiles/projects/tree", params={"preview_limit": 50}).json()
++        assert payload["errors"] == []
++        rows = {s["id"]: s["automated"] for p in payload["projects"] for s in p.get("previewSessions") or []}
++        assert rows["worker-chat"] is True
++        assert rows["default-chat"] is False
++
++
+ class TestCrossProfileProjectTree:
+ 
+     def test_profile_sidebar_exclude_sources_hides_its_machine_sessions(self, client, profiles_on_disk):
+diff --git a/tests/hermes_cli/test_session_listing.py b/tests/hermes_cli/test_session_listing.py
+index 9251267a4e..653a69a3af 100644
+--- a/tests/hermes_cli/test_session_listing.py
++++ b/tests/hermes_cli/test_session_listing.py
+@@ -159,3 +159,36 @@ class TestQuerySessionListingLaneScope:
+         )
+ 
+         assert [row["id"] for row in rows] == ["foreign_59"]
++
++
++class TestAutomatedSources:
++    """[daveey] ``sessions.automated_sources`` stamps ``automated`` on listing rows."""
++
++    def _home(self, tmp_path, name, cfg):
++        home = tmp_path / name
++        home.mkdir()
++        (home / "config.yaml").write_text(cfg, encoding="utf-8")
++        return home
++
++    def _stamp(self, home):
++        from hermes_cli.session_listing import stamp_automated
++        rows = [{"id": "a", "source": "cli"}, {"id": "b", "source": "slack"}, {"id": "c", "source": None}]
++        return {r["id"]: r["automated"] for r in stamp_automated(rows, home)}
++
++    def test_listed_source_is_automated_unlisted_is_not(self, tmp_path):
++        home = self._home(tmp_path, "p", "sessions:\n  automated_sources: [slack]\n")
++        assert self._stamp(home) == {"a": False, "b": True, "c": False}
++
++    def test_star_marks_every_row(self, tmp_path):
++        home = self._home(tmp_path, "p", "sessions:\n  automated_sources: ['*']\n")
++        assert self._stamp(home) == {"a": True, "b": True, "c": True}
++
++    def test_unset_marks_nothing(self, tmp_path):
++        home = self._home(tmp_path, "p", "{}\n")
++        assert self._stamp(home) == {"a": False, "b": False, "c": False}
++
++    def test_each_store_reads_its_own_home(self, tmp_path):
++        bot = self._home(tmp_path, "bot", "sessions:\n  automated_sources: ['*']\n")
++        human = self._home(tmp_path, "human", "{}\n")
++        assert set(self._stamp(bot).values()) == {True}
++        assert set(self._stamp(human).values()) == {False}
+diff --git a/tui_gateway/contracts/projects_pets.py b/tui_gateway/contracts/projects_pets.py
+index 2f17d6b9cd..954a7e64a4 100644
+--- a/tui_gateway/contracts/projects_pets.py
++++ b/tui_gateway/contracts/projects_pets.py
+@@ -236,6 +236,8 @@ class ProjectTreeSession(StoredSessionRow):
+     sidebar renders, stamped with the profile it belongs to."""
+ 
+     profile: str | None = None
++    # [daveey] sessions.automated_sources matched this row's source (bot / test traffic).
++    automated: bool = False
+ 
+ 
+ class ProjectTreeLane(Result):
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 84c43e8295..4a99d3b287 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -328,9 +328,19 @@ def _project_tree_excluded_sources() -> list[str]:
+     return _PROJECT_TREE_EXCLUDED_SOURCES + [s for s in extra if s not in _PROJECT_TREE_EXCLUDED_SOURCES]
+ 
+ 
+-def _project_tree_row(r: dict) -> dict:
++def _project_tree_automated_sources() -> list[str]:
++    """This store's ``sessions.automated_sources`` [daveey], read under the caller's home scope
++    like ``_project_tree_excluded_sources`` (the all-profiles tree applies each profile's own)."""
++    from hermes_cli.session_listing import automated_session_sources
++    from hermes_constants import get_hermes_home
++    return automated_session_sources(get_hermes_home())
++
++
++def _project_tree_row(r: dict, automated_sources: list[str] | None = None) -> dict:
+     """Project a SessionDB row to the minimal shape the sidebar renders (grouping fields +
+-    what ``SidebarSessionRow`` reads), minus the heavy columns."""
++    what ``SidebarSessionRow`` reads), minus the heavy columns. ``automated`` [daveey] marks
++    bot/test traffic per ``sessions.automated_sources`` (the sidebar hides it by default)."""
++    from hermes_cli.session_listing import is_automated_source
+     row = {k: r.get(k) for k in (
+         "id", "_lineage_root_id", "_lineage_ids", "parent_session_id",
+         "_reset_from", "_branched_from", "title", "preview")}
+@@ -341,7 +351,8 @@ def _project_tree_row(r: dict) -> dict:
+         **{k: r.get(k) or 0 for k in (
+             "message_count", "tool_call_count", "input_tokens", "output_tokens")},
+         **{k: r.get(k) for k in ("actual_cost_usd", "estimated_cost_usd", "model")},
+-        is_active=False, **{k: r.get(k) for k in ("cwd", "git_branch", "git_repo_root")})
++        is_active=False, **{k: r.get(k) for k in ("cwd", "git_branch", "git_repo_root")},
++        automated=is_automated_source(r.get("source"), automated_sources or []))
+     return row
+ 
+ 
+@@ -376,7 +387,8 @@ def _project_tree_inputs(
+         limit=session_limit, offset=0, order_by_last_active=True, min_message_count=1,
+         include_children=False, exclude_sources=_project_tree_excluded_sources(),
+         include_archived=False, compact_rows=True)
+-    sessions = _annotate_tree_activity([_project_tree_row(r) for r in rows])
++    automated = _project_tree_automated_sources()
++    sessions = _annotate_tree_activity([_project_tree_row(r, automated) for r in rows])
+     # Parallel-warm the git cache so build_tree's resolver doesn't cold-probe each cwd in turn.
+     git_probe.warm_roots(s["cwd"] for s in sessions if s.get("cwd"))
+     from hermes_cli import projects_db as pdb
+-- 
+2.54.0 (Apple Git-157)
+

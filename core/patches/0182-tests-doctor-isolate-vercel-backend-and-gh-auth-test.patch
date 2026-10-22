@@ -1,0 +1,35 @@
+From 2cdd51b12aa0e565d31c7b35847b44192dd0e9f0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 07:27:44 +0000
+Subject: [PATCH] tests(doctor): isolate vercel-backend and gh-auth tests from
+ container/gh-less runners [daveey] (#16)
+
+---
+ tests/hermes_cli/test_doctor.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/tests/hermes_cli/test_doctor.py b/tests/hermes_cli/test_doctor.py
+index b8ffe1caf8..2310d10154 100644
+--- a/tests/hermes_cli/test_doctor.py
++++ b/tests/hermes_cli/test_doctor.py
+@@ -318,6 +318,8 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
+     monkeypatch.delenv("VERCEL_PROJECT_ID", raising=False)
+     monkeypatch.setenv("VERCEL_TEAM_ID", "team")
+     monkeypatch.setattr(importlib.util, "find_spec", lambda name: object() if name == "vercel" else None)
++    # Inside a container (e.g. a containerized CI runner) doctor forces the local backend and skips this check.
++    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+ 
+     fake_model_tools = types.SimpleNamespace(
+         check_tool_availability=lambda *a, **kw: ([], []),
+@@ -1094,6 +1096,8 @@ class TestGitHubTokenCheck:
+             return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"Logged in to github.com")
+ 
+         monkeypatch.setattr(subprocess, "run", gh_2_98)
++        # Don't depend on a real gh being on PATH (absent on CI runners).
++        monkeypatch.setattr("hermes_cli.doctor_tools._safe_which", lambda cmd: f"/usr/bin/{cmd}")
+         assert doctor_state._gh_authenticated() is True
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

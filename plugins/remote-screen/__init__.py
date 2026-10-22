@@ -44,6 +44,16 @@ else:  # loaded by file path (pytest)
     _sys.modules[_spec.name] = rfb  # dataclasses look the module up by name
     _spec.loader.exec_module(rfb)
 
+if __package__:
+    from . import screen_guard
+else:
+    _gspec = _ilu.spec_from_file_location("remote_screen_guard", Path(__file__).with_name("screen_guard.py"))
+    screen_guard = _ilu.module_from_spec(_gspec)
+    _gspec.loader.exec_module(screen_guard)
+TURNS = screen_guard.TURNS
+pre_tool_call = screen_guard.pre_tool_call
+pre_llm_call = screen_guard.pre_llm_call
+
 log = logging.getLogger("remote-screen")
 TOOLSET = "remote_screen"
 KEYCHAIN_SERVICE = "hermes-remote-screen"
@@ -595,6 +605,9 @@ def _deps_ok() -> bool:
 
 
 def register(ctx) -> None:
+    # The guard needs no cryptography/Pillow: always on, even where the tools are not registered.
+    ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
     if not _deps_ok():
         log.info("remote-screen: cryptography/Pillow missing; tools not registered")
         return

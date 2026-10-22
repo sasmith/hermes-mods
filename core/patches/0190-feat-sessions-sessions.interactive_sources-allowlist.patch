@@ -1,0 +1,214 @@
+From 50820537f0da33a3b98e3fe8d4127050df3521e9 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 10:31:16 -0700
+Subject: [PATCH] feat(sessions): sessions.interactive_sources allowlist marks
+ every other source automated [daveey]
+
+A deny-list (automated_sources) leaks any new bot/eval/scratch source that writes into a human
+profile until someone lists it by hand (96 selfheal-replay rows on hub default, 2026-10-22).
+When interactive_sources is non-empty, a non-empty source outside it is stamped automated on
+every sidebar payload (sidebar slices, unified list, project tree), read from each store's own
+home like automated_sources. [] keeps the old behaviour; source-less legacy rows never flagged.
+---
+ hermes_cli/config_defaults.py                 |  5 ++
+ hermes_cli/session_listing.py                 | 56 ++++++++++++++-----
+ .../hermes_cli/test_profiles_sidebar_scope.py | 16 ++++++
+ tests/hermes_cli/test_session_listing.py      | 38 +++++++++++++
+ tui_gateway/methods_projects.py               |  2 +-
+ 5 files changed, 103 insertions(+), 14 deletions(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 8baa358e58..6ab16f8610 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2342,6 +2342,11 @@ DEFAULT_CONFIG = {
+         # sidebar hides those rows unless "Show automated & test sessions" is on (pinned and
+         # blocked / needs-input rows stay). "*" = every session in this profile. [daveey]
+         "automated_sources": [],
++        # Allowlist twin of automated_sources: when non-empty, every session whose source is NOT
++        # listed is `automated` too (hidden behind the same toggle), so a new bot / eval / scratch
++        # source writing into a human profile stays out of the sidebar by default. Rows with no
++        # source are never flagged by this list. [] = off (only automated_sources applies). [daveey]
++        "interactive_sources": [],
+         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
+         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
+         # deleted AND freelist/page_count > 25%.
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index 8c2abe97c1..b78f52c649 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -57,12 +57,9 @@ def sidebar_excluded_sources(hermes_home: str | Path) -> list[str]:
+ AUTOMATED_ALL_SOURCES = "*"
+ 
+ 
+-def automated_session_sources(hermes_home: str | Path) -> list[str]:
+-    """``sessions.automated_sources`` from *hermes_home*'s own config.yaml [daveey]: session sources
+-    this profile marks ``automated`` (bot / smoke-test traffic the desktop sidebar hides unless
+-    "Show automated & test sessions" is on). ``"*"`` marks every session in the store. Like
+-    ``sidebar_exclude_sources`` the store's home decides, never the process ``HERMES_HOME``.
+-    ``[]`` when unset or unreadable."""
++def _sessions_source_list(hermes_home: str | Path, key: str) -> list[str]:
++    """Lower-cased ``sessions.<key>`` source list from *hermes_home*'s own config.yaml [daveey];
++    ``[]`` when unset or unreadable (a comma string is accepted too)."""
+     from hermes_cli.config import load_config_readonly
+     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+ 
+@@ -73,7 +70,7 @@ def automated_session_sources(hermes_home: str | Path) -> list[str]:
+         return []
+     finally:
+         reset_hermes_home_override(token)
+-    raw = sessions_cfg.get("automated_sources") if isinstance(sessions_cfg, dict) else None
++    raw = sessions_cfg.get(key) if isinstance(sessions_cfg, dict) else None
+     if isinstance(raw, str):
+         raw = raw.split(",")
+     if not isinstance(raw, (list, tuple)):
+@@ -81,21 +78,54 @@ def automated_session_sources(hermes_home: str | Path) -> list[str]:
+     return [str(s).strip().lower() for s in raw if str(s).strip()]
+ 
+ 
+-def is_automated_source(source: Any, automated_sources: list[str]) -> bool:
+-    """Whether a row with *source* is automated under *automated_sources* (``"*"`` = all)."""
++class AutomatedSourcePolicy(list):
++    """``sessions.automated_sources`` (the list itself, so existing list callers keep working) plus
++    ``interactive`` = ``sessions.interactive_sources`` [daveey]. A non-empty ``interactive`` turns
++    the classifier into an allowlist: any source outside it is automated, so a NEW bot / eval /
++    scratch source writing into a human profile is hidden by default instead of leaking."""
++
++    def __init__(self, automated=(), interactive=()):
++        super().__init__(automated)
++        self.interactive: list[str] = list(interactive)
++
++    def __bool__(self) -> bool:  # an allowlist-only policy is still a policy
++        return bool(len(self) or self.interactive)
++
++
++def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
++    """``sessions.automated_sources`` + ``sessions.interactive_sources`` from *hermes_home*'s own
++    config.yaml [daveey]: which session sources this profile marks ``automated`` (bot / smoke-test
++    traffic the desktop sidebar hides unless "Show automated & test sessions" is on).
++    ``automated_sources``: exact sources, ``"*"`` marks every session in the store.
++    ``interactive_sources``: when non-empty, every source NOT listed is automated too.
++    Like ``sidebar_exclude_sources`` the store's home decides, never the process ``HERMES_HOME``.
++    Empty policy when unset or unreadable."""
++    return AutomatedSourcePolicy(
++        _sessions_source_list(hermes_home, "automated_sources"),
++        _sessions_source_list(hermes_home, "interactive_sources"))
++
++
++def is_automated_source(source: Any, automated_sources: list[str] | None) -> bool:
++    """Whether a row with *source* is automated under *automated_sources* (``"*"`` = all). When it
++    is an :class:`AutomatedSourcePolicy` with ``interactive`` sources, a non-empty source outside
++    that allowlist is automated too. A row with no source at all (legacy) is never flagged by the
++    allowlist alone: hiding unknown human chats is worse than showing one stray row."""
+     if not automated_sources:
+         return False
+-    if AUTOMATED_ALL_SOURCES in automated_sources:
++    src = str(source or "").strip().lower()
++    if AUTOMATED_ALL_SOURCES in automated_sources or (src and src in automated_sources):
+         return True
+-    return str(source or "").strip().lower() in automated_sources
++    interactive = getattr(automated_sources, "interactive", None)
++    return bool(interactive) and bool(src) and src not in interactive
+ 
+ 
+ def stamp_automated(
+     rows: list[dict[str, Any]], hermes_home: str | Path | None = None, *,
+     automated_sources: list[str] | None = None,
+ ) -> list[dict[str, Any]]:
+-    """Set ``automated: bool`` on every row from its store's ``sessions.automated_sources``
+-    (read from *hermes_home* unless *automated_sources* is given). Returns *rows*."""
++    """Set ``automated: bool`` on every row from its store's ``sessions.automated_sources`` /
++    ``sessions.interactive_sources`` (read from *hermes_home* unless *automated_sources* is
++    given). Returns *rows*."""
+     if automated_sources is None:
+         automated_sources = automated_session_sources(hermes_home) if hermes_home is not None else []
+     for row in rows:
+diff --git a/tests/hermes_cli/test_profiles_sidebar_scope.py b/tests/hermes_cli/test_profiles_sidebar_scope.py
+index 750805145d..0b6cda6e66 100644
+--- a/tests/hermes_cli/test_profiles_sidebar_scope.py
++++ b/tests/hermes_cli/test_profiles_sidebar_scope.py
+@@ -185,6 +185,22 @@ class TestAutomatedSessions:
+         assert rows["worker-chat"] is True
+         assert rows["default-chat"] is False
+ 
++    def test_interactive_allowlist_flags_unlisted_sources_per_profile(self, client, profiles_on_disk):
++        # [daveey] worker allowlists desktop only; a new eval source there is automated while the
++        # default profile (no allowlist) keeps the same source visible.
++        (profiles_on_disk["worker"] / "config.yaml").write_text(
++            "sessions:\n  interactive_sources: [desktop]\n", encoding="utf-8")
++        _seed_session(profiles_on_disk["worker"], "worker-desk", source="desktop")
++        _seed_session(profiles_on_disk["worker"], "worker-eval", source="selfheal-replay")
++        _seed_session(profiles_on_disk["default"], "default-eval", source="selfheal-replay")
++        rows = client.get("/api/profiles/sessions", params={"limit": 50}).json()["sessions"]
++        assert {r["id"]: r["automated"] for r in rows} == {
++            "worker-desk": False, "worker-eval": True, "default-eval": False}
++        tree = client.get("/api/profiles/projects/tree", params={"preview_limit": 50}).json()
++        flags = {s["id"]: s["automated"] for p in tree["projects"] for s in p.get("previewSessions") or []}
++        assert flags["worker-eval"] is True and flags["worker-desk"] is False
++        assert flags["default-eval"] is False
++
+ 
+ class TestCrossProfileProjectTree:
+ 
+diff --git a/tests/hermes_cli/test_session_listing.py b/tests/hermes_cli/test_session_listing.py
+index 653a69a3af..c5b4e5bbe3 100644
+--- a/tests/hermes_cli/test_session_listing.py
++++ b/tests/hermes_cli/test_session_listing.py
+@@ -192,3 +192,41 @@ class TestAutomatedSources:
+         human = self._home(tmp_path, "human", "{}\n")
+         assert set(self._stamp(bot).values()) == {True}
+         assert set(self._stamp(human).values()) == {False}
++
++
++class TestInteractiveSources:
++    """[daveey] ``sessions.interactive_sources`` is an allowlist: unlisted sources are automated."""
++
++    _home = TestAutomatedSources._home
++
++    def _stamp(self, home):
++        from hermes_cli.session_listing import stamp_automated
++        rows = [{"id": "d", "source": "desktop"}, {"id": "r", "source": "selfheal-replay"},
++                {"id": "s", "source": "scratch"}, {"id": "n", "source": None},
++                {"id": "D", "source": " Desktop "}]
++        return {r["id"]: r["automated"] for r in stamp_automated(rows, home)}
++
++    def test_unlisted_source_is_automated_listed_is_not(self, tmp_path):
++        home = self._home(tmp_path, "p", "sessions:\n  interactive_sources: [desktop, cli]\n")
++        assert self._stamp(home) == {"d": False, "r": True, "s": True, "n": False, "D": False}
++
++    def test_empty_allowlist_keeps_old_behaviour(self, tmp_path):
++        home = self._home(tmp_path, "p", "sessions:\n  interactive_sources: []\n  automated_sources: [scratch]\n")
++        assert self._stamp(home) == {"d": False, "r": False, "s": True, "n": False, "D": False}
++
++    def test_automated_sources_still_wins_over_allowlist(self, tmp_path):
++        home = self._home(tmp_path, "p", "sessions:\n  interactive_sources: [desktop]\n  automated_sources: [desktop]\n")
++        assert self._stamp(home)["d"] is True
++
++    def test_each_store_reads_its_own_home(self, tmp_path):
++        strict = self._home(tmp_path, "strict", "sessions:\n  interactive_sources: [desktop]\n")
++        loose = self._home(tmp_path, "loose", "{}\n")
++        assert self._stamp(strict)["r"] is True
++        assert self._stamp(loose)["r"] is False
++
++    def test_policy_is_truthy_with_only_an_allowlist(self, tmp_path):
++        from hermes_cli.session_listing import automated_session_sources, is_automated_source
++        pol = automated_session_sources(self._home(tmp_path, "p", "sessions:\n  interactive_sources: [desktop]\n"))
++        assert pol and list(pol) == [] and pol.interactive == ["desktop"]
++        assert is_automated_source("kanban", pol) and not is_automated_source("desktop", pol)
++        assert not is_automated_source("kanban", ["slack"])  # plain list callers: unchanged
+diff --git a/tui_gateway/methods_projects.py b/tui_gateway/methods_projects.py
+index 4a99d3b287..02e6e5208d 100644
+--- a/tui_gateway/methods_projects.py
++++ b/tui_gateway/methods_projects.py
+@@ -339,7 +339,7 @@ def _project_tree_automated_sources() -> list[str]:
+ def _project_tree_row(r: dict, automated_sources: list[str] | None = None) -> dict:
+     """Project a SessionDB row to the minimal shape the sidebar renders (grouping fields +
+     what ``SidebarSessionRow`` reads), minus the heavy columns. ``automated`` [daveey] marks
+-    bot/test traffic per ``sessions.automated_sources`` (the sidebar hides it by default)."""
++    bot/test traffic per ``sessions.automated_sources`` / ``interactive_sources`` (the sidebar hides it by default)."""
+     from hermes_cli.session_listing import is_automated_source
+     row = {k: r.get(k) for k in (
+         "id", "_lineage_root_id", "_lineage_ids", "parent_session_id",
+-- 
+2.55.0
+

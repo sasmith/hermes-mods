@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 if __package__:
-    from . import core, engage, follow
+    from . import core, engage, follow, ownerops
 else:  # imported outside a package (e.g. pytest collecting this dir)
     import importlib.util as _ilu
     import sys as _sys
@@ -47,6 +47,7 @@ else:  # imported outside a package (e.g. pytest collecting this dir)
     core = _sib("slack_workspace_core", "core.py")
     engage = _sib("slack_workspace_engage", "engage.py")
     follow = _sib("slack_workspace_follow", "follow.py")
+    ownerops = _sib("slack_workspace_ownerops", "ownerops.py")
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class State:
         self.store = core.Store(root)
         self.engs = engage.Engagements(self.store)
         self.runner: Any = None
+        self.ownerops: Any = None
         self.adapter: Any = None
         self.native: Any = None
         self._chan_list: tuple[float, list] = (0.0, [])
@@ -215,8 +217,25 @@ STATE: dict[str, State] = {}
 # Observation
 # =================================================================================================
 
+def _owner_ops(state: State):
+    if state.ownerops is None:
+        home = state.store.root.parent
+        state.ownerops = ownerops.OwnerOps(
+            state.store.root, owners=lambda: ownerops.owner_ids(ownerops.home_cfg(home)), bot_home=home,
+            profile=lambda: ownerops.ops_profile(ownerops.home_cfg(home)),
+            api=lambda m, p=None: core.call(state.token(), m, p))
+    return state.ownerops
+
+
 def _route_event(state: State, ev: dict) -> bool:
-    """Record + route one event. True = it belongs to an engagement (ambient bot must not see it)."""
+    """Record + route one event. True = it belongs to an engagement or to the owner's ops profile
+    (ambient bot must not see it)."""
+    try:
+        if _owner_ops(state).route(ev):
+            logger.info("mac-ops: owner DM %s ts=%s -> ops profile", ev.get("channel"), ev.get("ts"))
+            return True
+    except Exception as exc:  # routing must never break dispatch
+        logger.warning("mac-ops routing failed: %s", exc)
     r = engage.route(ev, state.engs, bot_user_id=state.bot_user_id())
     if r.decision != "engaged":
         return False
@@ -943,6 +962,36 @@ FHANDLERS = {"slack_post": ftool_post, "slack_react": ftool_react, "slack_read":
              "slack_engagements": ftool_engagements}
 
 
+HANDOFF_DESC = ("Hand the owner's request about one of their own machines (their MacBook / Mac mini: display, mouse, "
+                "frozen app, reboot, 'fix it from here') to the owner-only machine-repair agent, which diagnoses, "
+                "repairs and posts a screenshot in this DM thread. Use it when the owner DMs you such a request, "
+                "or after run_in_user_terminal is refused for the owner's DM. Works only in the owner's own Slack DM; "
+                "never give the owner commands or keyboard steps to paste instead.")
+
+
+def _register_handoff(ctx, state: State) -> None:
+    def handler(args, **kw):
+        try:
+            def env(name):
+                return _session(name[len("HERMES_SESSION_"):])
+
+            def last_owner_msg(ch, owner):
+                # The owner's own latest human message in this DM (Slack-verified store), not the model's text.
+                rows = [r for r in state.store.recent(ch, time.time() - 3600, limit=50)
+                        if r.get("user") == owner and not r.get("bot") and (r.get("text") or "").strip()]
+                return rows[-1] if rows else None
+            return ownerops.handoff_tool(_owner_ops(state), dict(args or {}), env=env, last_owner_msg=last_owner_msg)
+        except Exception as exc:
+            logger.warning("mac_ops_handoff failed: %s", exc, exc_info=True)
+            return _out({"ok": False, "error": str(exc)})
+
+    schema = {"name": "mac_ops_handoff", "description": HANDOFF_DESC, "parameters": {
+        "type": "object", "properties": {"request": {"type": "string", "description": "the owner's request, in their words"}},
+        "required": ["request"]}}
+    ctx.register_tool(name="mac_ops_handoff", toolset=TOOLSET, schema=schema, handler=handler, description=HANDOFF_DESC,
+                      check_fn=lambda: bool(ownerops.owner_ids(ownerops.home_cfg(state.store.root.parent))))
+
+
 def register(ctx):
     try:
         from hermes_constants import get_hermes_home
@@ -972,6 +1021,8 @@ def register(ctx):
             "type": "object", "properties": props, "required": required}}
         ctx.register_tool(name=name, toolset=TOOLSET, schema=schema, handler=handler, description=desc,
                           check_fn=state.available)
+
+    _register_handoff(ctx, state)
 
     peer = follow.Peer(root.parent)
     for name, (desc, props, required, where) in FSCHEMAS.items():

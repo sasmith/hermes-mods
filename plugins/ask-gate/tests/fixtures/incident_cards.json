@@ -1,0 +1,14 @@
+[
+ {
+  "title": "Remove Superhuman: revoke Google access + cancel subscription (needs David signed in)",
+  "assignee": "default",
+  "initial_status": "blocked",
+  "body": "David moved to plain Gmail (2026-10-21). Superhuman's 12 Gmail labels were already deleted (messages untouched); nothing was snoozed or muted.\n\nNeeds David (user@example.com is signed out in his Chrome; sign-in uses his passkey):\n1. Revoke Superhuman's access at https://myaccount.google.com/connections, or sign in to user@example.com in Chrome, unblock this card, and the agent will do it.\n2. Cancel the Superhuman subscription (billing, his call) in Superhuman \u2192 Settings \u2192 Billing.\n3. Gmail inbox tabs: Settings \u2192 Inbox \u2192 Inbox type \"Default\" (Primary/Promotions/Updates/Social). The API can't set this; the agent can do it in Chrome once he's signed in.\n\nDone when: Superhuman is gone from the connections page, the subscription is cancelled, and the Gmail tabs show. Context: ~/code/hermes/docs/polspam.md"
+ },
+ {
+  "title": "polspam: add Email Routing permission to cf-example-infra token, then create user@example.com",
+  "assignee": "default",
+  "initial_status": "blocked",
+  "body": "Plan step: a throwaway alias user@example.com for future political donations and petitions, so any list that sells the address can be shut off.\n\nBlocked: the token-broker scope `user/cf-example-infra` returns \"Authentication error\" on GET /zones/<example.org>/email/routing/rules. David needs to add **Zone \u2192 Email Routing Rules: Edit** (plus Account \u2192 Email Routing Addresses: Read) for example.org to that Cloudflare API token (dash.cloudflare.com \u2192 My Profile \u2192 API Tokens), then unblock this card.\n\nAfter unblock, the agent will:\n1. Create a routing rule: user@example.com \u2192 forward to user@example.com (check that the destination is verified).\n2. In ~/.hermes/bin/polspam, treat mail addressed to user@example.com as political even when it isn't bulk mail (still respecting the allowlist), deploy it to the mini (~/.bb-hermes/bin/polspam), and send a test email.\n3. Update ~/code/hermes/docs/polspam.md."
+ }
+]

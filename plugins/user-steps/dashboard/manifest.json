@@ -1,0 +1,9 @@
+{
+  "name": "user-steps",
+  "label": "User Steps",
+  "description": "Ledger of what each chat is waiting for the user to do; backs the Desktop 'For you' strip and ::user-step boxes.",
+  "icon": "ListChecks",
+  "version": "0.1.0",
+  "tab": {"hidden": true},
+  "api": "plugin_api.py"
+}

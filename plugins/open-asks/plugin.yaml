@@ -6,6 +6,8 @@ description: >
   filed/blocked a card or points at an already-blocked card; reminds the next turn to archive the card once
   answered.
 author: daveey
+# Superseded by user-steps (model-based ask extraction, Desktop 'For you' strip, one rolling card per chat).
+retired: user-steps
 provides_hooks:
   - pre_llm_call
   - transform_tool_result

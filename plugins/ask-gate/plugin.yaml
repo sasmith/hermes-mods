@@ -1,0 +1,14 @@
+name: ask-gate
+version: 0.1.0
+description: >
+  Makes it mechanically hard to ask the user for something without checking first. Injects live Kanban card
+  status each turn, judges every ask in a final reply with a cheap aux model before it is shown (holds and nudges
+  when the ask is stale, already answered, unverified or doable by the agent), refuses blocked cards that lack a
+  verified Checked: line, rewrites unverified "David's call" leftovers in worker handoffs into FYI lines, and keeps
+  a ledger of asks the user already answered.
+author: daveey
+provides_hooks:
+  - pre_llm_call
+  - post_tool_call
+  - pre_tool_call
+  - pre_final_gate

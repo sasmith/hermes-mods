@@ -154,6 +154,19 @@ class State:
         return sum(1 for c in self.cards(session_id) if now - c.get("t", 0) < window_s)
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def blocked_ids(db_paths: list[Path], ids: list[str]) -> set[str]:
     """Which of ``ids`` are currently ``blocked`` on any board (an already-tracked ask)."""
     found: set[str] = set()
@@ -162,7 +175,7 @@ def blocked_ids(db_paths: list[Path], ids: list[str]) -> set[str]:
     ph = ",".join("?" * len(ids))
     for p in db_paths:
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            c = _ro_connect(p, timeout=2)
             found |= {r[0] for r in c.execute(f"select id from tasks where status='blocked' and id in ({ph})", ids)}
             c.close()
         except sqlite3.Error:
@@ -175,7 +188,7 @@ def subscriptions(db_paths: list[Path], task_id: str) -> set[tuple[str, str]]:
     out: set[tuple[str, str]] = set()
     for p in db_paths:
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            c = _ro_connect(p, timeout=2)
             out |= {(r[0], r[1]) for r in c.execute(
                 "select platform, chat_id from kanban_notify_subs where task_id=?", (task_id,))}
             c.close()
@@ -191,7 +204,7 @@ def statuses(db_paths: list[Path], ids: list[str]) -> dict[str, str]:
     ph = ",".join("?" * len(ids))
     for p in db_paths:
         try:
-            c = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=2)
+            c = _ro_connect(p, timeout=2)
             out.update({r[0]: r[1] for r in c.execute(f"select id, status from tasks where id in ({ph})", ids)})
             c.close()
         except sqlite3.Error:

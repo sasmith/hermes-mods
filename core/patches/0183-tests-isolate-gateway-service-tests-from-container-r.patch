@@ -1,0 +1,67 @@
+From 62ad0ec2a9e652875f55afd867933f486aa564f8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:34:26 -0700
+Subject: [PATCH] tests: isolate gateway service tests from container runner;
+ keep delivery ledger out of typing-timeout test (#17)
+
+---
+ tests/gateway/test_run_progress_topics.py                | 6 +++++-
+ tests/hermes_cli/test_gateway_multiplex_served_record.py | 5 +++++
+ tests/hermes_cli/test_gateway_service.py                 | 1 +
+ 3 files changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index e4811cd4c3..1f5c54477c 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -1761,6 +1761,10 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
+ ):
+     """A stuck post-delivery callback must not keep the typing task alive."""
+     monkeypatch.setattr(base_platform, "_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS", 0.01)
++    # The durable delivery ledger does SQLite work in a worker thread that can take >1s on a cold or
++    # loaded host; this test is about typing vs the hung callback, not the ledger.
++    import gateway.delivery_ledger as _ledger
++    monkeypatch.setattr(_ledger, "ledger_enabled", lambda: False)
+     adapter = ProgressCaptureAdapter()
+     events = []
+ 
+@@ -1795,7 +1799,7 @@ async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
+     adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
+ 
+     await asyncio.wait_for(
+-        adapter._process_message_background(event, session_key), timeout=1.0
++        adapter._process_message_background(event, session_key), timeout=5.0
+     )
+ 
+     assert [call["content"] for call in adapter.sent] == ["done"]
+diff --git a/tests/hermes_cli/test_gateway_multiplex_served_record.py b/tests/hermes_cli/test_gateway_multiplex_served_record.py
+index ecc309eb87..c67efa3408 100644
+--- a/tests/hermes_cli/test_gateway_multiplex_served_record.py
++++ b/tests/hermes_cli/test_gateway_multiplex_served_record.py
+@@ -39,6 +39,11 @@ def served_root(tmp_path, monkeypatch):
+     import hermes_constants
+     from gateway import status
+     monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
++    # These tests model a host (systemd) install; CI runs inside a container, where the service
++    # verbs refuse a user-scope install and setup prints the docker guidance instead.
++    import hermes_cli.gateway as _gw
++    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
++    monkeypatch.setattr(_gw, "is_container", lambda: False)
+     # Liveness is a VERIFIED identity: this pytest process stands in for the default gateway only
+     # because its command line reads as one; any other PID keeps its real command line.
+     real_cmdline = status._read_process_cmdline
+diff --git a/tests/hermes_cli/test_gateway_service.py b/tests/hermes_cli/test_gateway_service.py
+index 2c025b1581..b2937cada7 100644
+--- a/tests/hermes_cli/test_gateway_service.py
++++ b/tests/hermes_cli/test_gateway_service.py
+@@ -889,6 +889,7 @@ class TestGatewayServiceDetection:
+     def test_supports_systemd_services_returns_true_when_systemctl_present(self, monkeypatch):
+         monkeypatch.setattr(gateway_cli, "is_linux", lambda: True)
+         monkeypatch.setattr(gateway_cli, "is_wsl", lambda: False)
++        monkeypatch.setattr(gateway_cli, "is_container", lambda: False)  # CI runs in a container
+         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/usr/bin/systemctl")
+ 
+         assert gateway_cli.supports_systemd_services() is True
+-- 
+2.54.0 (Apple Git-157)
+

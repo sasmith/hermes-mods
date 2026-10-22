@@ -118,7 +118,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--out", default="")
     a = ap.parse_args()
-    db = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
+    db = core._ro_connect(a.db, timeout=5)
     since = time.time() - a.days * 86400
     all_turns = list(turns(db, since))
     by_sid: dict[str, list] = {}

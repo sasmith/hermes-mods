@@ -1,0 +1,1404 @@
+From 4eff2691da8cc027aed26c68aba09e9073881385 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:54:56 -0700
+Subject: [PATCH] fix(kanban): cards never park forever without showing as
+ waiting on someone [daveey]
+
+Root cause of 2026-10-21 "tasks not running, not blocked" (card t_96bf7912):
+
+1. Respawn guard: a completion-gate refusal ("PR acceptance ...") is never
+   blocker_auth. Any guard hold is capped (blocker_auth 30 min, others 6 h,
+   shared_blocker exempt): past the cap the dispatcher blocks the card with
+   the guard reason, since a held card never runs and the breaker can't trip.
+2. PR acceptance: a closed-unmerged PR is classification closed_unmerged;
+   the catch-all names the failed phase + exception type and no longer says
+   "check gh authentication". A binding to a closed-unmerged PR may be
+   replaced by a new published_pr in the same repo (pr_rebound event).
+3. Scheduled invariant: every schedule_task park carries wake_at (marker or
+   24 h default); a card awaiting a human answer can't be scheduled; the
+   dispatcher wakes legacy wake-less parks at their implied time (reason
+   marker, else park + 24 h) and moves human-kind ones to blocked. New
+   diagnostic scheduled_without_wake.
+4. Block-loop escalations in triage count as waiting on the user:
+   diagnostics escalated_waiting_on_user + waiting_behind_user (todo child of
+   a parent that needs the user); board_stats/`kanban stats` report
+   waiting_on_user.
+5. Top-level launches (serve/dashboard/gui/desktop/gateway, Electron main,
+   and the post-update Desktop reopen via `open`) drop a leaked kanban
+   worker / delegate-child identity env. A worker's `hermes update` reopened
+   Hermes.app with HERMES_DELEGATED_CHILD_CONTEXT + HERMES_KANBAN_*, so
+   every Desktop chat's kanban tools refused.
+---
+ .../electron/leaked-worker-env.test.ts        |  32 ++
+ apps/desktop/electron/leaked-worker-env.ts    |  41 ++
+ apps/desktop/electron/main.ts                 |  11 +
+ hermes_cli/kanban.py                          |   2 +
+ hermes_cli/kanban_continuation.py             |  66 ++-
+ hermes_cli/kanban_db.py                       |  40 +-
+ hermes_cli/kanban_db_dispatch.py              |  85 +++-
+ hermes_cli/kanban_diagnostics.py              | 106 +++++
+ hermes_cli/kanban_pr_acceptance.py            |  43 +-
+ hermes_cli/kanban_pr_acceptance_store.py      |  21 +-
+ hermes_cli/kanban_timed_park.py               |  24 +-
+ hermes_cli/main.py                            |   7 +
+ hermes_cli/main_desktop.py                    |   7 +-
+ hermes_cli/top_level_env.py                   |  76 ++++
+ tests/hermes_cli/test_kanban_continuation.py  |  18 +-
+ tests/hermes_cli/test_kanban_db.py            |   4 +-
+ tests/hermes_cli/test_kanban_diagnostics.py   |   5 +-
+ .../hermes_cli/test_kanban_park_invariants.py | 378 ++++++++++++++++++
+ tests/hermes_cli/test_kanban_timed_park.py    |   6 +-
+ tools/kanban_tools.py                         |   3 +-
+ 20 files changed, 945 insertions(+), 30 deletions(-)
+ create mode 100644 apps/desktop/electron/leaked-worker-env.test.ts
+ create mode 100644 apps/desktop/electron/leaked-worker-env.ts
+ create mode 100644 hermes_cli/top_level_env.py
+ create mode 100644 tests/hermes_cli/test_kanban_park_invariants.py
+
+diff --git a/apps/desktop/electron/leaked-worker-env.test.ts b/apps/desktop/electron/leaked-worker-env.test.ts
+new file mode 100644
+index 0000000000..e290342b66
+--- /dev/null
++++ b/apps/desktop/electron/leaked-worker-env.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'vitest'
++
++import { scrubLeakedWorkerEnv } from './leaked-worker-env'
++
++describe('scrubLeakedWorkerEnv', () => {
++  it('drops a worker identity env inherited by the Desktop', () => {
++    const env: NodeJS.ProcessEnv = {
++      HERMES_DELEGATED_CHILD_CONTEXT: '/Users/x/.hermes',
++      HERMES_KANBAN_BOARD: 'default',
++      HERMES_KANBAN_DB: '/Users/x/.hermes/kanban.db',
++      HERMES_KANBAN_WORKSPACE: '/Users/x/.hermes/kanban/workspaces/t_45d5a361',
++      HERMES_KANBAN_WORKSPACES_ROOT: '/Users/x/.hermes/kanban/workspaces',
++      PATH: '/bin'
++    }
++
++    expect(scrubLeakedWorkerEnv(env).sort()).toEqual([
++      'HERMES_DELEGATED_CHILD_CONTEXT',
++      'HERMES_KANBAN_BOARD',
++      'HERMES_KANBAN_DB',
++      'HERMES_KANBAN_WORKSPACE',
++      'HERMES_KANBAN_WORKSPACES_ROOT'
++    ])
++    expect(env).toEqual({ PATH: '/bin' })
++  })
++
++  it('keeps a deliberate board pin when no worker marker is present', () => {
++    const env: NodeJS.ProcessEnv = { HERMES_KANBAN_BOARD: 'x', HERMES_KANBAN_DB: '/tmp/k.db' }
++
++    expect(scrubLeakedWorkerEnv(env)).toEqual([])
++    expect(env).toEqual({ HERMES_KANBAN_BOARD: 'x', HERMES_KANBAN_DB: '/tmp/k.db' })
++  })
++})
+diff --git a/apps/desktop/electron/leaked-worker-env.ts b/apps/desktop/electron/leaked-worker-env.ts
+new file mode 100644
+index 0000000000..af5bc406bd
+--- /dev/null
++++ b/apps/desktop/electron/leaked-worker-env.ts
+@@ -0,0 +1,41 @@
++// A Desktop launched from inside a kanban worker / delegate child (a worker's `hermes update`
++// reopening the app with `open`) inherits that worker's identity env. Every backend, terminal
++// and CLI the Desktop spawns would then believe it is that worker's delegate child: kanban tools
++// refuse ("delegate_task child contexts cannot mutate Kanban") and the board is pinned to the
++// worker's DB (2026-10-21, Hermes.app pid 59331). The Desktop is never a worker, so drop them at
++// startup. Mirrors hermes_cli/top_level_env.py. [daveey]
++
++// Presence of any of these means the env was inherited from a worker or delegate child.
++export const WORKER_MARKER_KEYS = [
++  'HERMES_DELEGATED_CHILD_CONTEXT',
++  'HERMES_KANBAN_TASK',
++  'HERMES_KANBAN_WORKSPACE',
++  'HERMES_KANBAN_RUN_ID',
++  'HERMES_KANBAN_CLAIM_LOCK'
++] as const
++
++// Board pins are only dropped together with a marker: set alone they are an operator choice.
++export const WORKER_ENV_KEYS = [
++  ...WORKER_MARKER_KEYS,
++  'HERMES_KANBAN_BRANCH',
++  'HERMES_KANBAN_GOAL_MODE',
++  'HERMES_KANBAN_GOAL_MAX_TURNS',
++  'HERMES_KANBAN_DB',
++  'HERMES_KANBAN_BOARD',
++  'HERMES_KANBAN_WORKSPACES_ROOT'
++] as const
++
++/** Remove leaked worker identity keys from `env` in place; returns the removed key names. */
++export function scrubLeakedWorkerEnv(env: NodeJS.ProcessEnv = process.env): string[] {
++  if (!WORKER_MARKER_KEYS.some(key => Boolean(env[key]))) {
++    return []
++  }
++
++  const removed = WORKER_ENV_KEYS.filter(key => key in env)
++
++  for (const key of removed) {
++    delete env[key]
++  }
++
++  return removed
++}
+diff --git a/apps/desktop/electron/main.ts b/apps/desktop/electron/main.ts
+index 6bbd090c23..113118949d 100644
+--- a/apps/desktop/electron/main.ts
++++ b/apps/desktop/electron/main.ts
+@@ -336,6 +336,7 @@ import { linuxOzoneBackend, resolveHudWindowing } from './hud-windowing'
+ import { INSTALL_STAMP, installShape } from './install-stamp'
+ import type { InstallStamp } from './install-stamp'
+ import { applyLaunchProfileOverride } from './launch-profile'
++import { scrubLeakedWorkerEnv } from './leaked-worker-env'
+ import { fetchLinkTitle, resolveFaviconCached } from './link-metadata'
+ import { CHROMIUM_LOG_FILENAME, enableLinuxCrashDiagnostics, linuxCrashDiagnostics } from './linux-crash-diagnostics'
+ import {
+@@ -1290,6 +1291,16 @@ if (process.env.HERMES_DESKTOP_TMPDIR) {
+   delete process.env.HERMES_DESKTOP_TMPDIR
+ }
+ 
++// Launched from inside a kanban worker / delegate child: never pass its identity on to the
++// backend, terminals or CLIs this Desktop spawns (see leaked-worker-env.ts). [daveey]
++{
++  const leaked = scrubLeakedWorkerEnv()
++
++  if (leaked.length) {
++    console.error(`[hermes] dropped inherited worker env: ${leaked.join(', ')}`)
++  }
++}
++
+ const HERMES_HOME: string = resolveDesktopHermesHome({
+   home: app.getPath('home'),
+   directoryExists,
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index e8cad65478..a2c2607407 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -1195,6 +1195,8 @@ def _cmd_stats(args: argparse.Namespace) -> int:
+         print("\nBy assignee:")
+         for who, counts in sorted(stats["by_assignee"].items()):
+             print(f"  {who:20s}  {_fmt_counts(counts)}")
++    if stats.get("waiting_on_user"):
++        print(f"\nWaiting on you: {stats['waiting_on_user']} ({', '.join(stats['waiting_on_user_ids'][:10])})")
+     age = stats["oldest_ready_age_seconds"]
+     if age is not None:
+         print(f"\nOldest ready task age: {int(age)}s")
+diff --git a/hermes_cli/kanban_continuation.py b/hermes_cli/kanban_continuation.py
+index 6d3bc20b38..dcb9b35bea 100644
+--- a/hermes_cli/kanban_continuation.py
++++ b/hermes_cli/kanban_continuation.py
+@@ -200,10 +200,12 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+ 
+     now = int(time.time()) if now is None else int(now)
+     woken: list[str] = []
+-    for row in conn.execute("SELECT id FROM tasks WHERE status = 'scheduled'").fetchall():
++    for row in conn.execute("SELECT id, block_kind FROM tasks WHERE status = 'scheduled'").fetchall():
+         tid = row[0]
+         payload = pending_wake(conn, tid)
+         if payload is None:
++            # Invariant: every scheduled card has a wake or becomes blocked. [daveey]
++            _enforce_wake_invariant(conn, tid, row[1], now, woken)
+             continue
+         wake_at = payload["wake_at"]
+         if wake_at > now:
+@@ -223,6 +225,68 @@ def wake_due_continuations(conn: sqlite3.Connection, *, now: Optional[int] = Non
+     return woken
+ 
+ 
++HUMAN_BLOCK_KINDS = ("needs_input", "capability")
++
++
++def missing_wake(conn: sqlite3.Connection, task_id: str) -> Optional[dict]:
++    """For a ``scheduled`` card with no timed wake: ``{"parked_at", "wake_at", "reason"}`` with the
++    wake implied by ``kanban_timed_park.implied_wake`` (None when the card has a real wake). [daveey]"""
++    from hermes_cli import kanban_db as kb
++    from hermes_cli.kanban_timed_park import implied_wake
++
++    marks = ",".join("?" for _ in SCHEDULED_ENTRY_EVENTS)
++    event = conn.execute(
++        f"SELECT kind, payload, created_at FROM task_events WHERE task_id = ? AND kind IN ({marks}) "
++        "ORDER BY id DESC LIMIT 1", (task_id, *SCHEDULED_ENTRY_EVENTS),
++    ).fetchone()
++    if event is not None and pending_wake_payload(event[0], event[1]) is not None:
++        return None
++    if event is None:
++        last = conn.execute("SELECT MAX(created_at) FROM task_events WHERE task_id = ?", (task_id,)).fetchone()
++        parked_at = int(last[0]) if last and last[0] else int(time.time())
++        payload: dict = {}
++    else:
++        parked_at, payload = int(event[2]), kb._json_dict(event[1])
++    reason = payload.get("reason") if isinstance(payload.get("reason"), str) else None
++    return {"parked_at": parked_at, "wake_at": implied_wake(payload, parked_at), "reason": reason}
++
++
++def _enforce_wake_invariant(conn, tid: str, block_kind: Optional[str], now: int, woken: list) -> bool:
++    """A scheduled card without a wake (parked by older code, or by ``kanban_schedule`` before
++    every park carried one): a human-kind card goes to ``blocked`` at once -- it waits on a
++    person, and ``scheduled`` hid it from every needs-me surface (t_6feb6afd, 2+ days) --
++    anything else wakes at its implied time. True when the card moved. [daveey]"""
++    from hermes_cli import kanban_db as kb
++
++    info = missing_wake(conn, tid)
++    if info is None:
++        return False
++    if block_kind in HUMAN_BLOCK_KINDS:
++        reason = kb._latest_block_reason(conn, tid) or info["reason"] or (
++            "Parked in scheduled with no wake while waiting on a human answer.")
++        with kb.write_txn(conn):
++            cur = conn.execute(
++                "UPDATE tasks SET status = 'blocked', current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
++                (tid,))
++            if cur.rowcount == 1:
++                kb._append_event(conn, tid, "blocked", {
++                    "reason": reason, "kind": block_kind, "source_status": "scheduled",
++                    "wake_invariant": "human wait parked without a wake"})
++        return cur.rowcount == 1
++    if info["wake_at"] > now:
++        return False
++    with kb.write_txn(conn):
++        landing = kb._landing_status_after_parents(conn, tid)
++        cur = conn.execute(
++            "UPDATE tasks SET status = ?, current_run_id = NULL WHERE id = ? AND status = 'scheduled'",
++            (landing, tid))
++        if cur.rowcount == 1:
++            kb._append_event(conn, tid, CONTINUATION_WOKEN_EVENT, {
++                "status": landing, "wake_at": info["wake_at"], "implied_wake": True})
++            woken.append(tid)
++    return cur.rowcount == 1
++
++
+ def render_checkpoint_context(conn: sqlite3.Connection, task_id: str) -> str:
+     """The newest ``continued`` checkpoint, if no run has completed since. Placed near the top
+     of the worker context so the next run resumes instead of re-orienting from scratch."""
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 2be318866b..5d1dcd862c 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1689,12 +1689,13 @@ def task_graph_contexts(conn: sqlite3.Connection, task_ids: Iterable[str]) -> di
+     placeholders = ",".join("?" for _ in ordered_ids)
+     for bucket, own, other in (("parents", "child_id", "parent_id"), ("children", "parent_id", "child_id")):
+         for row in conn.execute(
+-            f"SELECT l.{own} AS owner_id, t.id, t.title, t.status "
++            f"SELECT l.{own} AS owner_id, t.id, t.title, t.status, t.block_kind "
+             f"FROM task_links l JOIN tasks t ON t.id = l.{other} "
+             f"WHERE l.{own} IN ({placeholders}) ORDER BY l.{own}, t.id", tuple(ordered_ids),
+         ).fetchall():
+             contexts[row["owner_id"]][bucket].append(
+-                {"id": row["id"], "title": row["title"], "status": row["status"]}
++                {"id": row["id"], "title": row["title"], "status": row["status"],
++                 "block_kind": row["block_kind"]}
+             )
+     return contexts
+ 
+@@ -4034,9 +4035,13 @@ def schedule_task(
+     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
+     expected_run_id: Optional[int] = None,
+ ) -> bool:
+-    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
+-    until ``unblock_task`` re-gates it."""
++    """Park in ``scheduled`` (waiting on time, not a human; not dispatchable) until its wake
++    (``SCHEDULED_UNTIL=`` in the reason, else ``kanban_timed_park.DEFAULT_WAKE_SECONDS``) or an
++    ``unblock_task``. Refused (False) while the card waits on a human answer: ``scheduled`` is
++    not on any needs-me surface, so such a park hid the ask (t_6feb6afd). [daveey]"""
+     with write_txn(conn):
++        if _awaiting_human_answer(conn, task_id):
++            return False
+         params: list[Any] = [task_id]
+         sql = """
+             UPDATE tasks
+@@ -4060,6 +4065,24 @@ def schedule_task(
+         return True
+ 
+ 
++def _awaiting_human_answer(conn: sqlite3.Connection, task_id: str) -> bool:
++    """True when the card's outstanding ask is for a human: a human-kind ``block_kind``
++    (``needs_input``/``capability``) whose latest ``blocked``/``block_loop_detected`` event
++    has had no ``unblocked`` and no new run (``claimed``) since. [daveey]"""
++    row = conn.execute("SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    if row is None or _row_get(row, "block_kind") not in ("needs_input", "capability"):
++        return False
++    ask = conn.execute(
++        "SELECT MAX(id) FROM task_events WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')",
++        (task_id,)).fetchone()[0]
++    if ask is None:
++        return row["status"] == "blocked"
++    answered = conn.execute(
++        "SELECT 1 FROM task_events WHERE task_id = ? AND id > ? AND kind IN ('unblocked', 'claimed') LIMIT 1",
++        (task_id, ask)).fetchone()
++    return answered is None
++
++
+ # --- Worker context builder (what a spawned worker sees) ---
+ 
+ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
+@@ -4309,10 +4332,19 @@ def board_stats(conn: sqlite3.Connection) -> dict:
+         if oldest_row and oldest_row["ts"] is not None else None
+     )
+ 
++    # Waiting on the user: human-kind ``blocked`` plus block-loop escalations in ``triage``
++    # (they keep their human ``block_kind``). A plain triage card awaiting a specifier is not. [daveey]
++    waiting_ids = [r["id"] for r in conn.execute(
++        "SELECT id FROM tasks WHERE (status = 'blocked' AND (block_kind IS NULL OR block_kind IN "
++        "('needs_input', 'capability'))) OR (status = 'triage' AND block_kind IN ('needs_input', 'capability')) "
++        "ORDER BY id")]
++
+     return {
+         "by_status": by_status,
+         "by_assignee": by_assignee,
+         "oldest_ready_age_seconds": oldest_ready_age,
++        "waiting_on_user": len(waiting_ids),
++        "waiting_on_user_ids": waiting_ids,
+         "now": now,
+     }
+ 
+diff --git a/hermes_cli/kanban_db_dispatch.py b/hermes_cli/kanban_db_dispatch.py
+index a5e8293fc5..3a88be1900 100644
+--- a/hermes_cli/kanban_db_dispatch.py
++++ b/hermes_cli/kanban_db_dispatch.py
+@@ -71,6 +71,57 @@ _RESPAWN_BLOCKER_RE = re.compile(
+     re.IGNORECASE,
+ )
+ 
++# ``last_failure_error`` written by the completion gates (PR acceptance, ...) starts with
++# this: the worker ran, its completion was refused, and the next run must retry or rebind.
++# It is never a worker/provider quota or auth failure, whatever words the gate detail
++# contains, so it never matches ``blocker_auth``. [daveey]
++_COMPLETION_GATE_ERROR_PREFIXES = ("PR acceptance ",)
++
++# A guard hold that never ends parks a card in ``ready`` forever with nothing on the board
++# saying so (2026-10-21: ``blocker_auth`` held t_10de9798 for hours; a held card never
++# runs, so ``consecutive_failures`` never grows and the breaker never trips). Past the cap
++# the dispatcher blocks the card with the guard reason so it shows as waiting on someone.
++# ``blocker_auth`` gets the short cap: it never clears without a human. Every other guard
++# is time-bounded by design and only hits the long cap when something is wrong.
++# ``shared_blocker`` holds are exempt: they are a declared wall another card is probing.
++# Override via ``HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS`` / ``..._LONG_SECONDS``. [daveey]
++DEFAULT_GUARD_HOLD_CAP_SECONDS = 30 * 60
++DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS = 6 * 3600
++_GUARD_HOLD_SHORT_CAP_REASONS = frozenset({"blocker_auth"})
++_GUARD_HOLD_EXEMPT_REASONS = frozenset({"shared_blocker"})
++
++
++def _env_seconds(name: str, default: int) -> int:
++    try:
++        return max(0, int(os.environ.get(name, "") or default))
++    except ValueError:
++        return default
++
++
++def guard_hold_cap_seconds(reason: str) -> Optional[int]:
++    """Max seconds the respawn guard may hold a card for ``reason`` (None = no cap)."""
++    if reason in _GUARD_HOLD_EXEMPT_REASONS:
++        return None
++    if reason in _GUARD_HOLD_SHORT_CAP_REASONS:
++        return _env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", DEFAULT_GUARD_HOLD_CAP_SECONDS)
++    return _env_seconds("HERMES_KANBAN_GUARD_HOLD_CAP_LONG_SECONDS", DEFAULT_GUARD_HOLD_CAP_LONG_SECONDS)
++
++
++def _guard_hold_started_at(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
++    """When the current unbroken run of ``respawn_guarded`` events began: the first one
++    after the newest event of any other kind (a claim, a block, an unblock, a comment...)."""
++    row = conn.execute(
++        "SELECT MIN(created_at) FROM task_events WHERE task_id = ? AND kind = 'respawn_guarded' "
++        "AND id > COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ? "
++        "AND kind != 'respawn_guarded'), 0)", (task_id, task_id),
++    ).fetchone()
++    return int(row[0]) if row and row[0] is not None else None
++
++
++def _is_completion_gate_error(err: str) -> bool:
++    return err.lstrip().startswith(_COMPLETION_GATE_ERROR_PREFIXES)
++
++
+ # Within this window a completed run counts as "recent proof"; don't re-spawn.
+ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
+ 
+@@ -1590,6 +1641,30 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+         )
+ 
+ 
++def _block_if_guard_hold_capped(conn: sqlite3.Connection, task_id: str, reason: str) -> bool:
++    """Block ``task_id`` when the guard has held it for ``reason`` past the cap. [daveey]"""
++    cap = guard_hold_cap_seconds(reason)
++    if cap is None:
++        return False
++    started = _guard_hold_started_at(conn, task_id)
++    if started is None:
++        return False
++    held = int(time.time()) - started
++    if held < cap:
++        return False
++    row = conn.execute("SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,)).fetchone()
++    err = _kb._first_line(_kb._lossy_text(row["last_failure_error"]) if row else "", 300) or "(no error recorded)"
++    minutes = max(1, held // 60)
++    message = (f"Held in ready by the respawn guard ({reason}) for {minutes} min without running. "
++               f"Last error: {err} Fix the cause (credentials, quota, PR binding), then unblock.")
++    kind = "capability" if reason in _GUARD_HOLD_SHORT_CAP_REASONS else "needs_input"
++    try:
++        return bool(_kb.block_task(conn, task_id, reason=message, kind=kind))
++    except Exception:
++        _kb._log.warning("kanban: auto-blocking guard-held %s failed", task_id, exc_info=True)
++        return False
++
++
+ def check_respawn_guard(
+     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+ ) -> Optional[str]:
+@@ -1602,7 +1677,9 @@ def check_respawn_guard(
+     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
+     ``last_failure_error`` that would otherwise park the task forever — that
+     path never increments ``consecutive_failures``), ``"blocker_auth"``
+-    (quota/auth pattern; the breaker still trips eventually), then for the
++    (quota/auth pattern from a worker/provider failure, never a completion-gate
++    refusal; a held card never runs, so the breaker can NOT trip — the
++    dispatcher's hold cap, :func:`guard_hold_cap_seconds`, blocks it instead), then for the
+     ready lane only ``"recent_success"`` (completed run within the window, unless
+     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
+     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
+@@ -1656,7 +1733,8 @@ def check_respawn_guard(
+     # benign commands such as ``claude auth status`` (#117097).
+     err = _kb._lossy_text(row["last_failure_error"])
+     latest_outcome = latest_run["outcome"] if latest_run is not None else None
+-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
++    if (err and latest_outcome != "crashed" and not _is_completion_gate_error(err)
++            and _RESPAWN_BLOCKER_RE.search(err)):
+         return "blocker_auth"
+ 
+     # 2b. Shared external blocker (``kanban_shared_blockers``): while another
+@@ -2161,6 +2239,9 @@ def _dispatch_lane_task(
+         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
+         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
+         if not dry_run:
++            if _block_if_guard_hold_capped(conn, task_id, guard_reason):
++                result.auto_blocked.append(task_id)
++                return False
+             with _kb.write_txn(conn):
+                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
+         return False
+diff --git a/hermes_cli/kanban_diagnostics.py b/hermes_cli/kanban_diagnostics.py
+index 63558f13d4..dd0500d9c2 100644
+--- a/hermes_cli/kanban_diagnostics.py
++++ b/hermes_cli/kanban_diagnostics.py
+@@ -775,6 +775,109 @@ def _rule_overdue_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
+     )]
+ 
+ 
++def _latest_parking_event(events):
++    from hermes_cli import kanban_continuation as kc
++
++    parking = None
++    for idx, ev in enumerate(events or []):
++        if _event_kind(ev) not in kc.SCHEDULED_ENTRY_EVENTS:
++            continue
++        key = (_event_ts(ev), int(_task_field(ev, "id", default=0) or 0), idx)
++        if parking is None or key >= parking[0]:
++            parking = (key, ev)
++    return parking[1] if parking else None
++
++
++def _rule_scheduled_without_wake(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A ``scheduled`` card whose parking event carries no ``wake_at``: nothing on the board
++    will ever wake it (parked by older code, or its waking cron was deleted). The dispatcher
++    wakes it at the implied time (``kanban_timed_park.implied_wake``) or blocks a human-kind
++    one; this makes the gap visible meanwhile. [daveey]"""
++    from hermes_cli import kanban_continuation as kc
++    from hermes_cli.kanban_timed_park import implied_wake
++
++    if _task_field(task, "status") != "scheduled":
++        return []
++    ev = _latest_parking_event(events)
++    payload = _parse_payload(ev) if ev is not None else {}
++    if ev is not None and kc.pending_wake_payload(_event_kind(ev), payload) is not None:
++        return []
++    parked_at = _event_ts(ev) if ev is not None else int(_task_field(task, "created_at", default=now) or now)
++    wake_at = implied_wake(payload, parked_at)
++    human = _task_field(task, "block_kind") in kc.HUMAN_BLOCK_KINDS
++    return [Diagnostic(
++        kind="scheduled_without_wake", severity="error" if human or wake_at <= now else "warning",
++        title="Scheduled with no wake time",
++        detail=("This card is parked in scheduled but its park recorded no wake time, so only a cron "
++                "or a human would ever resume it. "
++                + ("It waits on a human answer; the dispatcher moves it to blocked."
++                   if human else "The dispatcher wakes it at the implied time.")),
++        actions=[DiagnosticAction(kind="unblock", label="Resume the task now", suggested=True)],
++        first_seen_at=parked_at, last_seen_at=parked_at, count=1,
++        data={"parked_at": parked_at, "implied_wake_at": wake_at},
++    )]
++
++
++def _block_loop_ask(events) -> Optional[str]:
++    """Reason of the newest ``block_loop_detected`` event with no human input after it."""
++    latest = None
++    for ev in events or []:
++        kind = _event_kind(ev)
++        if kind == "block_loop_detected":
++            latest = ev
++        elif latest is not None and kind in ("commented", "edited", "status", "unblocked", "promoted"):
++            latest = None
++    if latest is None:
++        return None
++    return str(_parse_payload(latest).get("reason") or "").strip() or "(no reason recorded)"
++
++
++def _rule_escalated_waiting_on_user(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """Block-loop detection moved a repeatedly re-blocked card to ``triage``. It keeps its human
++    ``block_kind`` and waits on the user exactly like ``blocked`` -- surface it as such. [daveey]"""
++    from hermes_cli import kanban_continuation as kc
++
++    if _task_field(task, "status") != "triage" or _task_field(task, "block_kind") not in kc.HUMAN_BLOCK_KINDS:
++        return []
++    ask = _block_loop_ask(events)
++    if ask is None:
++        return []
++    ts = _latest_event_ts(events, {"block_loop_detected"}) or now
++    task_id = str(_task_field(task, "id") or "")
++    return [Diagnostic(
++        kind="escalated_waiting_on_user", severity="error",
++        title="Waiting on you (block-loop escalation)",
++        detail=f"The worker re-blocked on the same ask repeatedly, so the card was escalated to triage: {ask}",
++        actions=[_cli_hint("Answer, then return it to work", f"hermes kanban promote {task_id}", suggested=True)],
++        first_seen_at=ts, last_seen_at=ts, count=1, data={"ask": ask},
++    )]
++
++
++def _rule_waiting_behind_user(task, events, runs, now, cfg) -> list[Diagnostic]:
++    """A ``todo`` card gated on a parent that waits on the user (human-kind ``blocked``, or a
++    block-loop escalation in ``triage``): it looks queued but cannot move until the user acts. [daveey]"""
++    from hermes_cli import kanban_continuation as kc
++
++    if _task_field(task, "status") != "todo":
++        return []
++    graph = cfg.get("_graph")
++    if not isinstance(graph, dict):
++        return []
++    waiting = [p for p in (graph.get("parents") or []) if isinstance(p, dict) and (
++        (p.get("status") == "blocked" and p.get("block_kind") in (None, *kc.HUMAN_BLOCK_KINDS))
++        or (p.get("status") == "triage" and p.get("block_kind") in kc.HUMAN_BLOCK_KINDS))]
++    if not waiting:
++        return []
++    ids = [str(p.get("id")) for p in waiting]
++    return [Diagnostic(
++        kind="waiting_behind_user", severity="warning",
++        title=f"Waiting behind {len(ids)} parent(s) that need you",
++        detail="This card cannot start until these parents get a human answer: " + ", ".join(ids),
++        actions=[_cli_hint("Show the blocking parent", f"hermes kanban show {ids[0]}", suggested=True)],
++        first_seen_at=now, last_seen_at=now, count=len(ids), data={"waiting_on": ids},
++    )]
++
++
+ # Order matters: earlier rules render first on severity ties.
+ _RULES: list[RuleFn] = [
+     _rule_hallucinated_cards,
+@@ -788,6 +891,9 @@ _RULES: list[RuleFn] = [
+     _rule_block_unblock_cycling,
+     _rule_stranded_in_ready,
+     _rule_overdue_wake,
++    _rule_scheduled_without_wake,
++    _rule_escalated_waiting_on_user,
++    _rule_waiting_behind_user,
+ ]
+ 
+ 
+diff --git a/hermes_cli/kanban_pr_acceptance.py b/hermes_cli/kanban_pr_acceptance.py
+index 7a060c2467..c7674a7086 100644
+--- a/hermes_cli/kanban_pr_acceptance.py
++++ b/hermes_cli/kanban_pr_acceptance.py
+@@ -110,8 +110,11 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                "pr_url": published_pr, "checks": [],
+                "recovery": "Fix required failures, rerun infrastructure checks or wait, then retry completion. "
+                            "Use kanban_block if human input is needed; receipts remain on the task event log."}
++    # Named in the catch-all detail so a failure says WHICH read broke, not "check gh auth". [daveey]
++    phase = "resolving the assignee profile"
+     try:
+         profile_home = _assignee_profile_home(assignee)
++        phase = "matching the published PR to the contract"
+         declared = _PR.fullmatch(contract)
+         url = contract if declared else published_pr
+         match = _PR.fullmatch(url or "")
+@@ -121,6 +124,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         repo, number = match[1], int(match[2])
+         receipt["pr_url"] = url
+         owner, name = repo.split("/")
++        phase = "reading the PR"
+         query = f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)}){{pullRequest(number:{number:d}){{headRefOid baseRefName state\n            baseRef{{branchProtectionRule{{requiredStatusChecks{{context app{{databaseId}}}}}}}}}}}}}}'
+         repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
+         if repository is None:
+@@ -129,10 +133,19 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         pr = repository["pullRequest"]
+         sha, branch = pr["headRefOid"], pr["baseRefName"]
+         receipt["head_sha"] = sha
++        if pr["state"] == "CLOSED":
++            # Closed without merging (e.g. the code landed by a direct push): this PR can never
++            # be accepted. Name it, and the way out: a new PR rebinds the contract. [daveey]
++            receipt.update(classification="closed_unmerged",
++                           detail=f"Bound PR {url} was closed without merging; it can never pass acceptance. "
++                                  "Open (or find) the PR that carries the change and complete with "
++                                  "metadata.published_pr=<that PR URL>; a closed-unmerged binding is replaced.")
++            return receipt
+         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
+-            raise ValueError("PR is closed or current head is unavailable")
++            raise ValueError("PR head is unavailable")
+         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
+         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
++        phase = "reading branch rules"
+         rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                      paginate=True, profile_home=profile_home)
+         for page in rules:
+@@ -144,11 +157,13 @@ def collect_acceptance(contract: str, published_pr: str | None,
+         if not required:
+             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
+             return receipt
++        phase = "reading check runs"
+         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
+                      paginate=True, profile_home=profile_home)
+         runs = [run for page in pages for run in page["check_runs"]]
+         if len({r["id"] for r in runs}) != pages[0]["total_count"]:
+             raise ValueError("Incomplete check-run pagination")
++        phase = "reading commit statuses"
+         statuses = [{**s, "sha": sha} for page in _api(f"repos/{repo}/commits/{sha}/statuses?per_page=100",
+                                                        paginate=True, profile_home=profile_home) for s in page]
+         outcomes = []
+@@ -171,6 +186,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                     "head_sha": check.get("head_sha", check.get("sha")),
+                     "classification": classification, "conclusion": outcome})
+         # Re-read after all pages: old-head successes are never transferable.
++        phase = "re-reading the PR head"
+         current = _api(f"repos/{repo}/pulls/{number}", profile_home=profile_home)
+         if current["head"]["sha"] != sha or current["base"]["ref"] != branch or (current["state"] == "closed" and not current.get("merged")):
+             receipt.update(classification="stale", detail="PR head/base changed while collecting evidence; retry.")
+@@ -184,12 +200,33 @@ def collect_acceptance(contract: str, published_pr: str | None,
+                        detail=f"GitHub refused the acceptance read ({exc}) as {login}; "
+                               "fix that profile's GitHub credentials/access to the repository, then retry completion.")
+         return receipt
+-    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError):
++    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, IndexError) as exc:
+         # Never persist gh stderr (credentials/host details); the failed phase is actionable.
+-        receipt.update(classification="infra", detail="GitHub acceptance evidence unavailable or incomplete; check gh authentication/API access and retry.")
++        # Auth refusals are ``_GateAuthError`` above, so this text must not blame gh auth:
++        # the respawn guard used to read "authentication" here as a provider auth wall. [daveey]
++        receipt.update(classification="infra",
++                       detail=f"GitHub acceptance evidence unavailable or incomplete while {phase} "
++                              f"({type(exc).__name__}); retry completion.")
+         return receipt
+ 
+ 
++def pr_closed_unmerged(url: str, assignee: str | None = None) -> bool:
++    """True only when GitHub positively reports PR ``url`` as closed and not merged.
++    Any error, or an open/merged PR, is False: a binding is replaced only on proof. [daveey]"""
++    match = _PR.fullmatch(url or "")
++    if not match:
++        return False
++    owner, name = match[1].split("/")
++    query = (f'{{repository(owner:{json.dumps(owner)},name:{json.dumps(name)})'
++             f'{{pullRequest(number:{int(match[2]):d}){{state}}}}}}')
++    try:
++        profile_home = _assignee_profile_home(assignee)
++        repository = _api("graphql", query=query, profile_home=profile_home)["data"]["repository"]
++        return bool(repository) and repository["pullRequest"]["state"] == "CLOSED"
++    except Exception:
++        return False
++
++
+ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
+     if check.get("head_sha", check.get("sha")) != sha:
+         return "stale"
+diff --git a/hermes_cli/kanban_pr_acceptance_store.py b/hermes_cli/kanban_pr_acceptance_store.py
+index bbc56b6725..0dc90efa1a 100644
+--- a/hermes_cli/kanban_pr_acceptance_store.py
++++ b/hermes_cli/kanban_pr_acceptance_store.py
+@@ -2,7 +2,8 @@
+ from __future__ import annotations
+ 
+ from hermes_cli.kanban_db_connect import write_txn
+-from hermes_cli.kanban_pr_acceptance import _PR, collect_acceptance
++from hermes_cli import kanban_pr_acceptance as _kpa
++from hermes_cli.kanban_pr_acceptance import _PR
+ 
+ 
+ def _snapshot(conn, task_id):
+@@ -29,10 +30,26 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
+             conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
+         snapshot = (run_id, status, published_pr)
+         contract = published_pr
++    elif match and published_pr != contract and (bound := _PR.fullmatch(contract)) and bound[1] == match[1]:
++        # Publication binds once -- unless the bound PR was closed without merging (the
++        # change shipped some other way). That PR can never be accepted, so a binding that
++        # cannot be replaced parks the card forever. Rebind only on GitHub's positive
++        # "closed, not merged" answer, and leave an audit event. [daveey]
++        assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
++        if _kpa.pr_closed_unmerged(contract, assignee):
++            from hermes_cli.kanban_db import _append_event
++            with write_txn(conn):
++                if _snapshot(conn, task_id) != snapshot:
++                    return False
++                conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (published_pr, task_id))
++                _append_event(conn, task_id, "pr_rebound", {"from": contract, "to": published_pr,
++                                                            "reason": "bound PR closed unmerged"}, run_id=run_id)
++            snapshot = (run_id, status, published_pr)
++            contract = published_pr
+     # The assignee profile's gh login owns the repo: acceptance must not run as
+     # the ambient login of whichever process completes the card (#122689).
+     assignee = conn.execute("SELECT assignee FROM tasks WHERE id=?", (task_id,)).fetchone()["assignee"]
+-    return snapshot, collect_acceptance(contract, published_pr, assignee=assignee)
++    return snapshot, _kpa.collect_acceptance(contract, published_pr, assignee=assignee)
+ 
+ 
+ def record_acceptance(conn, task_id, acceptance):
+diff --git a/hermes_cli/kanban_timed_park.py b/hermes_cli/kanban_timed_park.py
+index f51c2bab53..acef783968 100644
+--- a/hermes_cli/kanban_timed_park.py
++++ b/hermes_cli/kanban_timed_park.py
+@@ -52,11 +52,25 @@ def scheduled_until(reason: Optional[str], *, now: Optional[int] = None) -> Opti
+     return max(now + MIN_WAKE_SECONDS, min(epoch, now + MAX_WAKE_SECONDS))
+ 
+ 
+-def scheduled_payload(reason: Optional[str]) -> dict:
+-    """``scheduled`` event payload for ``kanban_schedule``: a ``SCHEDULED_UNTIL=`` marker is a
+-    real timer (``wake_due_continuations``); without one the card waits for a cron/human."""
+-    wake_at = scheduled_until(reason)
+-    return {"reason": reason, "wake_at": wake_at} if wake_at else {"reason": reason}
++def scheduled_payload(reason: Optional[str], *, now: Optional[int] = None) -> dict:
++    """``scheduled`` event payload for ``kanban_schedule``. Every scheduled card carries a wake:
++    a ``SCHEDULED_UNTIL=`` marker sets it, otherwise ``DEFAULT_WAKE_SECONDS``. A park without
++    one waited on a cron/human that may never come (a deleted cron left t_2ba76784 parked for
++    days); a cron or ``unblock`` still wakes the card earlier. [daveey]"""
++    now = int(time.time()) if now is None else int(now)
++    wake_at = scheduled_until(reason, now=now) or now + DEFAULT_WAKE_SECONDS
++    return {"reason": reason, "wake_at": wake_at}
++
++
++def implied_wake(payload: dict, event_at: int) -> int:
++    """Wake time for a parking event written before every park carried ``wake_at``: the
++    ``SCHEDULED_UNTIL=`` marker in its reason, else ``DEFAULT_WAKE_SECONDS`` after the park.
++    The marker is clamped against the park time, so an overdue legacy wake is due now. [daveey]"""
++    wake = payload.get("wake_at")
++    if isinstance(wake, (int, float)):
++        return int(wake)
++    reason = payload.get("reason")
++    return scheduled_until(reason if isinstance(reason, str) else None, now=event_at) or event_at + DEFAULT_WAKE_SECONDS
+ 
+ 
+ def is_timed_park(kind: Optional[str], reason: Optional[str], *, parents_satisfied: bool) -> bool:
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 4addb70713..80c580a07b 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -3528,6 +3528,13 @@ def _default_to_chat(args) -> None:
+ 
+ def main():
+     """Main entry point for hermes CLI."""
++    # A Desktop/serve/dashboard/gateway launched from inside a kanban worker must not inherit
++    # the worker's identity env (it fences every chat's kanban tools). Before any fast path. [daveey]
++    try:
++        from hermes_cli.top_level_env import scrub_for_top_level_launch
++        scrub_for_top_level_launch(sys.argv[1:])
++    except Exception:
++        pass
+     _set_process_title()
+     _warn_if_unsupervised_pid1()
+     _advertise_agent_env()
+diff --git a/hermes_cli/main_desktop.py b/hermes_cli/main_desktop.py
+index 60a97f4f8c..125919d6dd 100644
+--- a/hermes_cli/main_desktop.py
++++ b/hermes_cli/main_desktop.py
+@@ -434,6 +434,10 @@ def _relaunch_stopped_desktops(desktop_dir: Path, launches: list[list[str]]) ->
+         return []
+     opened: list[list[str]] = []
+     seen: set[tuple[str, ...]] = set()
++    # ``open`` hands this process's env to the app: from a worker's ``hermes update`` that made
++    # the Desktop a kanban "delegate child" (pid 59331, 2026-10-21). [daveey]
++    from hermes_cli.top_level_env import clean_launch_env
++    launch_env = clean_launch_env()
+     for args in launches:
+         if tuple(args) in seen:  # the single-instance lock would only focus a duplicate
+             continue
+@@ -445,7 +449,8 @@ def _relaunch_stopped_desktops(desktop_dir: Path, launches: list[list[str]]) ->
+             cmd = [str(exe), *args]
+         try:
+             subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+-                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
++                             stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
++                             env=launch_env)
+         except OSError as exc:
+             logger.warning("could not reopen the desktop app after the rebuild: %s", exc)
+             continue
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+new file mode 100644
+index 0000000000..ffbf7603d1
+--- /dev/null
++++ b/hermes_cli/top_level_env.py
+@@ -0,0 +1,76 @@
++"""Strip a kanban worker's / delegate child's identity env from top-level launches. [daveey]
++
++A dispatcher-spawned worker carries ``HERMES_KANBAN_TASK``/``..._WORKSPACE``/``..._DB`` pins and,
++in delegate children, ``HERMES_DELEGATED_CHILD_CONTEXT``. When a worker ran ``hermes update`` the
++update reopened Hermes Desktop with ``/usr/bin/open``, which hands the caller's environment to the
++app: the Desktop (and every backend and terminal it spawned) then believed it was that worker's
++delegate child, so every chat's kanban tools refused ("delegate_task child contexts cannot mutate
++Kanban") and the board was pinned to the worker's DB (2026-10-21, Hermes.app pid 59331).
++
++A Desktop, ``serve``/``dashboard`` backend or messaging gateway is never a worker. Each strips
++these keys at launch, and code that reopens Desktop passes :func:`clean_launch_env`.
++"""
++from __future__ import annotations
++
++import os
++from typing import MutableMapping, Optional, Sequence
++
++# Presence of any of these means the env was inherited from a worker or delegate child.
++WORKER_MARKER_KEYS: tuple[str, ...] = (
++    "HERMES_DELEGATED_CHILD_CONTEXT",
++    "HERMES_KANBAN_TASK",
++    "HERMES_KANBAN_WORKSPACE",
++    "HERMES_KANBAN_RUN_ID",
++    "HERMES_KANBAN_CLAIM_LOCK",
++)
++# Dispatcher-injected worker env (``kanban_db_dispatch._default_spawn``). The board pins are
++# only stripped together with a marker: set alone they are a deliberate operator choice.
++WORKER_ENV_KEYS: tuple[str, ...] = (
++    *WORKER_MARKER_KEYS,
++    "HERMES_KANBAN_BRANCH",
++    "HERMES_KANBAN_GOAL_MODE",
++    "HERMES_KANBAN_GOAL_MAX_TURNS",
++    "HERMES_KANBAN_DB",
++    "HERMES_KANBAN_BOARD",
++    "HERMES_KANBAN_WORKSPACES_ROOT",
++)
++
++# First positional argv of a top-level surface (never a worker).
++TOP_LEVEL_COMMANDS = frozenset({"serve", "dashboard", "gui", "desktop", "gateway"})
++
++
++def scrub_leaked_worker_env(environ: Optional[MutableMapping[str, str]] = None) -> list[str]:
++    """Remove worker/delegate identity keys from ``environ`` (default ``os.environ``) when any
++    worker marker is present. Returns the removed key names (empty when nothing leaked)."""
++    env = os.environ if environ is None else environ
++    if not any(env.get(key) for key in WORKER_MARKER_KEYS):
++        return []
++    removed = [key for key in WORKER_ENV_KEYS if key in env]
++    for key in removed:
++        env.pop(key, None)
++    return removed
++
++
++def clean_launch_env(base: Optional[MutableMapping[str, str]] = None) -> dict[str, str]:
++    """A copy of ``base`` (default ``os.environ``) safe to hand to a top-level app launch."""
++    env = dict(os.environ if base is None else base)
++    scrub_leaked_worker_env(env)
++    return env
++
++
++def _first_positional(argv: Sequence[str]) -> str:
++    return next((arg for arg in argv if arg and not arg.startswith("-")), "")
++
++
++def scrub_for_top_level_launch(argv: Sequence[str]) -> list[str]:
++    """Scrub ``os.environ`` when ``argv`` (``sys.argv[1:]``) launches a top-level surface."""
++    if _first_positional(argv) not in TOP_LEVEL_COMMANDS:
++        return []
++    removed = scrub_leaked_worker_env()
++    if removed:
++        import logging
++
++        logging.getLogger(__name__).warning(
++            "hermes %s: dropped inherited worker env %s (launched from a kanban worker/delegate child)",
++            _first_positional(argv), ", ".join(removed))
++    return removed
+diff --git a/tests/hermes_cli/test_kanban_continuation.py b/tests/hermes_cli/test_kanban_continuation.py
+index e3f9f09824..44898f7756 100644
+--- a/tests/hermes_cli/test_kanban_continuation.py
++++ b/tests/hermes_cli/test_kanban_continuation.py
+@@ -203,11 +203,13 @@ def test_wait_handoff_wakes_on_dispatcher_tick(home, monkeypatch):
+         task = kb.get_task(conn, tid)
+         assert (task.status, task.consecutive_failures) == ("ready", 0)
+         assert "waiting for CI run 9" in kb.build_worker_context(conn, tid)
+-        # A kanban_schedule park without a SCHEDULED_UNTIL marker is never auto-woken.
++        # A kanban_schedule park without a SCHEDULED_UNTIL marker still wakes, after the
++        # default wait: no scheduled card may depend on a cron that can vanish. [daveey]
+         tid2 = kb.create_task(conn, title="parked", assignee="default")
+         kb.claim_task(conn, tid2)
+         kb.schedule_task(conn, tid2, reason="waiting on the cron that unblocks it")
+-        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 3600) == []
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == [tid2]
+ 
+ 
+ def _park_with_wait(monkeypatch, title: str) -> tuple[str, int]:
+@@ -236,15 +238,16 @@ def test_due_wake_is_not_masked_by_later_annotation(home, monkeypatch, kind):
+ 
+ 
+ def test_kanban_schedule_after_wait_and_comment_still_stays_put(home, monkeypatch):
+-    """Re-parked with kanban_schedule (no wake time) after a timed wait: never auto-woken,
+-    even when a comment lands afterwards."""
++    """Re-parked with kanban_schedule (no marker) after a timed wait: it stays put for the
++    default wait, even when a comment lands afterwards, then wakes. [daveey]"""
++    from hermes_cli.kanban_timed_park import DEFAULT_WAKE_SECONDS
+     with kbc.connect_closing() as conn:
+         tid = kb.create_task(conn, title="parked", assignee="default")
+         kb.claim_task(conn, tid)
+         kb.schedule_task(conn, tid, reason="waiting on the cron that unblocks it")
+         kb.add_comment(conn, tid, "t_other", "FYI")
+-        assert kc.pending_wake(conn, tid) is None
+-        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10 ** 7) == []
++        assert kc.pending_wake(conn, tid)["wake_at"] >= int(time.time()) + DEFAULT_WAKE_SECONDS - 5
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 3600) == []
+         assert kb.get_task(conn, tid).status == "scheduled"
+     tid2, wake_at = _park_with_wait(monkeypatch, "wait then park")
+     with kbc.connect_closing() as conn:
+@@ -252,7 +255,8 @@ def test_kanban_schedule_after_wait_and_comment_still_stays_put(home, monkeypatc
+         kb.claim_task(conn, tid2)
+         kb.schedule_task(conn, tid2, reason="until release")
+         kb.add_comment(conn, tid2, "t_other", "FYI")
+-        assert kc.wake_due_continuations(conn, now=wake_at + 10 ** 6) == []
++        # The old continuation wake no longer applies; only the new park's own (default) wake does.
++        assert kc.wake_due_continuations(conn, now=wake_at + 60) == []
+         assert kb.get_task(conn, tid2).status == "scheduled"
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_db.py b/tests/hermes_cli/test_kanban_db.py
+index 22217ebc41..c198d38aa6 100644
+--- a/tests/hermes_cli/test_kanban_db.py
++++ b/tests/hermes_cli/test_kanban_db.py
+@@ -199,7 +199,9 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
+         assert kb.claim_task(conn, t) is None
+ 
+         events = kb.list_events(conn, t)
+-        assert any(e.kind == "scheduled" and e.payload == {"reason": "run next week"} for e in events)
++        # Every park carries a wake (default wait without a SCHEDULED_UNTIL marker). [daveey]
++        assert any(e.kind == "scheduled" and e.payload["reason"] == "run next week"
++                   and isinstance(e.payload.get("wake_at"), int) for e in events)
+ 
+ 
+ 
+diff --git a/tests/hermes_cli/test_kanban_diagnostics.py b/tests/hermes_cli/test_kanban_diagnostics.py
+index b4922ced03..65958203b0 100644
+--- a/tests/hermes_cli/test_kanban_diagnostics.py
++++ b/tests/hermes_cli/test_kanban_diagnostics.py
+@@ -245,4 +245,7 @@ def test_overdue_wake_ignores_kanban_schedule_parks():
+     now = 1_000_000
+     events = [_event("continued", ts=now - 5000, wake_at=now - 4000),
+               _event("scheduled", ts=now - 3000, reason="SCHEDULED_UNTIL=2030")]
+-    assert kd.compute_task_diagnostics(_task(status="scheduled"), events, [], now=now) == []
++    kinds = [d.kind for d in kd.compute_task_diagnostics(_task(status="scheduled"), events, [], now=now)]
++    assert "overdue_wake" not in kinds
++    # A park with no wake is its own signal now (the dispatcher wakes it at the implied time). [daveey]
++    assert kinds == ["scheduled_without_wake"]
+diff --git a/tests/hermes_cli/test_kanban_park_invariants.py b/tests/hermes_cli/test_kanban_park_invariants.py
+new file mode 100644
+index 0000000000..997ede7a2e
+--- /dev/null
++++ b/tests/hermes_cli/test_kanban_park_invariants.py
+@@ -0,0 +1,378 @@
++"""Cards must never park forever without showing as waiting on someone. [daveey]
++
++Regression tests for the 2026-10-21 incident: a PR-acceptance refusal stamped
++"check gh authentication" into ``last_failure_error`` and the respawn guard held
++the card in ``ready`` as ``blocker_auth`` on every tick, forever; scheduled cards
++sat with no wake; block-loop escalations in ``triage`` and their children were
++invisible as "waiting on the user"; a Desktop relaunched from a worker inherited
++the worker's kanban env.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++
++import pytest
++
++from hermes_cli import kanban_db as kb
++from hermes_cli import kanban_db_connect as kbc
++from hermes_cli import kanban_db_dispatch as kbd
++
++
++@pytest.fixture
++def kanban_home(tmp_path, monkeypatch):
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    monkeypatch.setattr(Path, "home", lambda: tmp_path)
++    for key in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
++                "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_DELEGATED_CHILD_CONTEXT"):
++        monkeypatch.delenv(key, raising=False)
++    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
++    kb.init_db()
++    return home
++
++
++def _continued_with_error(conn, tid, error):
++    """A run that ended ``continued`` (worker checkpointed) with ``error`` stamped."""
++    kb.claim_task(conn, tid)
++    run_id = kb.get_task(conn, tid).current_run_id
++    conn.execute("UPDATE task_runs SET outcome='continued', status='continued', ended_at=? WHERE id=?",
++                 (int(time.time()) - 5, run_id))
++    conn.execute("UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
++                 "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?", (error, tid))
++    conn.commit()
++
++
++# ---------------------------------------------------------------------------
++# 1. Respawn guard
++# ---------------------------------------------------------------------------
++
++GATE_TEXT_OLD = ("PR acceptance infra: GitHub acceptance evidence unavailable or incomplete; check gh "
++                 "authentication/API access and retry. Fix required failures, rerun infrastructure checks "
++                 "or wait, then retry completion.")
++
++
++@pytest.mark.parametrize("classification", ["infra", "auth", "closed_unmerged", "failure"])
++def test_completion_gate_refusal_is_never_blocker_auth(kanban_home, classification):
++    text = GATE_TEXT_OLD.replace("PR acceptance infra", f"PR acceptance {classification}")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="gate refused", assignee="a")
++        _continued_with_error(conn, tid, text)
++        assert kbd.check_respawn_guard(conn, tid) is None
++
++
++def test_provider_auth_failure_still_guards(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="provider auth", assignee="a")
++        _continued_with_error(conn, tid, "provider authentication failed: invalid api key")
++        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
++
++
++def test_guard_hold_is_capped_and_auto_blocks_with_reason(kanban_home, monkeypatch, all_assignees_spawnable):
++    """A card held by the guard past the cap leaves ``ready`` for ``blocked`` with the reason,
++    so it shows as waiting on someone instead of silently parking forever."""
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
++    spawned = []
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="held", assignee="a")
++        _continued_with_error(conn, tid, "provider authentication failed")
++        now = int(time.time())
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++        assert (tid, "blocker_auth") in res.respawn_guarded
++        assert kb.get_task(conn, tid).status == "ready"
++        # Still inside the cap: held, not blocked.
++        monkeypatch.setattr(kb.time, "time", lambda: now + 300)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++        assert kb.get_task(conn, tid).status == "ready"
++        # Past the cap: blocked with a reason naming the guard and the error.
++        monkeypatch.setattr(kb.time, "time", lambda: now + 700)
++        res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: spawned.append(a) or 1)
++        task = kb.get_task(conn, tid)
++        assert task.status == "blocked"
++        assert tid in res.auto_blocked
++        ev = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
++                          "ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++        reason = json.loads(ev["payload"])["reason"]
++        assert "blocker_auth" in reason and "provider authentication failed" in reason
++        assert not spawned
++
++
++def test_guard_hold_clock_restarts_after_a_real_run(kanban_home, monkeypatch, all_assignees_spawnable):
++    """Only an unbroken hold counts: guard events before a later claim don't add up."""
++    monkeypatch.setenv("HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS", "600")
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="held then ran", assignee="a")
++        _continued_with_error(conn, tid, "provider authentication failed")
++        now = int(time.time())
++        monkeypatch.setattr(kb.time, "time", lambda: now - 5000)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        monkeypatch.setattr(kb.time, "time", lambda: now - 100)
++        _continued_with_error(conn, tid, "provider authentication failed")  # a run happened since
++        monkeypatch.setattr(kb.time, "time", lambda: now)
++        kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1)
++        assert kb.get_task(conn, tid).status == "ready"
++
++
++# ---------------------------------------------------------------------------
++# 2. PR acceptance classification + rebind
++# ---------------------------------------------------------------------------
++
++def _fake_api(pr_states):
++    """``_api`` double: ``pr_states`` maps PR number -> (state, merged)."""
++    def api(endpoint, *, query=None, paginate=False, profile_home=None):
++        if endpoint == "graphql":
++            import re
++            number = int(re.search(r"pullRequest\(number:(\d+)\)", query)[1])
++            state = pr_states[number]
++            return {"data": {"repository": {"pullRequest": {
++                "headRefOid": "a" * 40, "baseRefName": "main", "state": state,
++                "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [
++                    {"context": "ci", "app": {"databaseId": 1}}]}}}}}}
++        if "/rules/branches/" in endpoint:
++            return [[]]
++        if "/check-runs" in endpoint:
++            raise KeyError("total_count")  # a malformed page: generic failure
++        raise AssertionError(endpoint)
++    return api
++
++
++def test_closed_unmerged_pr_gets_its_own_classification(monkeypatch):
++    from hermes_cli import kanban_pr_acceptance as kpa
++    monkeypatch.setattr(kpa, "_api", _fake_api({610: "CLOSED"}))
++    receipt = kpa.collect_acceptance("https://github.com/acme/repo/pull/610", None)
++    assert receipt["classification"] == "closed_unmerged"
++    assert "authentication" not in receipt["detail"]
++    assert "published_pr" in receipt["detail"]
++
++
++def test_catch_all_failure_names_the_phase_not_gh_auth(monkeypatch):
++    from hermes_cli import kanban_pr_acceptance as kpa
++    monkeypatch.setattr(kpa, "_api", _fake_api({7: "OPEN"}))
++    receipt = kpa.collect_acceptance("https://github.com/acme/repo/pull/7", None)
++    assert receipt["classification"] == "infra"
++    assert "authentication" not in receipt["detail"]
++    assert "check runs" in receipt["detail"]
++    assert "KeyError" in receipt["detail"]
++
++
++def test_rebind_allowed_when_bound_pr_closed_unmerged(kanban_home, monkeypatch):
++    from hermes_cli import kanban_pr_acceptance as kpa
++    from hermes_cli import kanban_pr_acceptance_store as store
++    monkeypatch.setattr(kpa, "_api", _fake_api({610: "CLOSED", 622: "MERGED"}))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr", assignee=None,
++                             completion_contract="https://github.com/acme/repo/pull/610")
++        kb.claim_task(conn, tid)
++        run_id = kb.get_task(conn, tid).current_run_id
++        store.prepare_acceptance(conn, tid, run_id, {"published_pr": "https://github.com/acme/repo/pull/622"})
++        row = conn.execute("SELECT completion_contract FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert row["completion_contract"] == "https://github.com/acme/repo/pull/622"
++        assert conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='pr_rebound'",
++                            (tid,)).fetchone() is not None
++
++
++def test_rebind_refused_while_bound_pr_open(kanban_home, monkeypatch):
++    from hermes_cli import kanban_pr_acceptance as kpa
++    from hermes_cli import kanban_pr_acceptance_store as store
++    monkeypatch.setattr(kpa, "_api", _fake_api({610: "OPEN", 622: "MERGED"}))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="pr", assignee=None,
++                             completion_contract="https://github.com/acme/repo/pull/610")
++        kb.claim_task(conn, tid)
++        run_id = kb.get_task(conn, tid).current_run_id
++        store.prepare_acceptance(conn, tid, run_id, {"published_pr": "https://github.com/acme/repo/pull/622"})
++        row = conn.execute("SELECT completion_contract FROM tasks WHERE id=?", (tid,)).fetchone()
++        assert row["completion_contract"] == "https://github.com/acme/repo/pull/610"
++
++
++# ---------------------------------------------------------------------------
++# 3. Scheduled invariant
++# ---------------------------------------------------------------------------
++
++def _parking_payload(conn, tid):
++    ev = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN "
++                      "('scheduled','continued') ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
++    return json.loads(ev["payload"] or "{}")
++
++
++def test_schedule_without_marker_still_gets_a_wake(kanban_home):
++    from hermes_cli import kanban_timed_park as ktp
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="sched", assignee="a")
++        before = int(time.time())
++        assert kb.schedule_task(conn, tid, reason=None)
++        wake = _parking_payload(conn, tid).get("wake_at")
++        assert isinstance(wake, int) and wake >= before + ktp.DEFAULT_WAKE_SECONDS - 5
++
++
++def test_human_wait_cannot_park_into_scheduled(kanban_home):
++    """A card whose outstanding ask is a human answer stays blocked, not scheduled."""
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="needs david", assignee="a")
++        kb.claim_task(conn, tid)
++        assert kb.block_task(conn, tid, reason="David: unlock the iPhone", kind="needs_input")
++        assert kb.get_task(conn, tid).status == "blocked"
++        assert not kb.schedule_task(conn, tid, reason=None)
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def _legacy_park(conn, tid, *, at, reason=None, block_kind=None):
++    """A scheduled card parked by old code: ``scheduled`` event with no ``wake_at``."""
++    conn.execute("UPDATE tasks SET status='scheduled', block_kind=? WHERE id=?", (block_kind, tid))
++    conn.execute("INSERT INTO task_events (task_id, kind, payload, created_at) VALUES (?, 'scheduled', ?, ?)",
++                 (tid, json.dumps({"reason": reason}), at))
++    conn.commit()
++
++
++def test_dispatcher_wakes_legacy_scheduled_card_without_wake(kanban_home):
++    from hermes_cli import kanban_continuation as kc
++    now = int(time.time())
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="legacy", assignee="a")
++        _legacy_park(conn, tid, at=now - 30 * 3600, reason="waiting on a cron")
++        fresh = kb.create_task(conn, title="fresh legacy", assignee="a")
++        _legacy_park(conn, fresh, at=now - 60, reason="waiting on a cron")
++        woken = kc.wake_due_continuations(conn, now=now)
++        assert tid in woken and fresh not in woken
++        assert kb.get_task(conn, tid).status == "ready"
++        assert kb.get_task(conn, fresh).status == "scheduled"
++
++
++def test_dispatcher_honours_marker_in_legacy_reason(kanban_home):
++    from hermes_cli import kanban_continuation as kc
++    now = int(time.time())
++    past = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now - 3600))
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="legacy marker", assignee="a")
++        _legacy_park(conn, tid, at=now - 2 * 3600, reason=f"SCHEDULED_UNTIL={past} soak")
++        assert tid in kc.wake_due_continuations(conn, now=now)
++
++
++def test_human_kind_scheduled_without_wake_becomes_blocked(kanban_home):
++    from hermes_cli import kanban_continuation as kc
++    now = int(time.time())
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="needs input parked", assignee="a")
++        _legacy_park(conn, tid, at=now - 60, reason=None, block_kind="needs_input")
++        kc.wake_due_continuations(conn, now=now)
++        assert kb.get_task(conn, tid).status == "blocked"
++
++
++def test_diagnostic_flags_scheduled_card_without_wake(kanban_home):
++    from hermes_cli import kanban_diagnostics as kd
++    now = int(time.time())
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="no wake", assignee="a")
++        _legacy_park(conn, tid, at=now - 60, reason=None)
++        task = kb.get_task(conn, tid)
++        diags = kd.compute_task_diagnostics(task, kb.list_events(conn, tid), kb.list_runs(conn, tid), now=now)
++        assert "scheduled_without_wake" in [d.kind for d in diags]
++
++
++# ---------------------------------------------------------------------------
++# 4. Block-loop escalations count as waiting on the user
++# ---------------------------------------------------------------------------
++
++def _escalate(conn, tid):
++    for _ in range(kb.BLOCK_RECURRENCE_LIMIT + 1):
++        task = kb.get_task(conn, tid)
++        if task.status == "triage":
++            return
++        if task.status == "blocked":
++            kb.unblock_task(conn, tid)
++        kb.claim_task(conn, tid)
++        kb.block_task(conn, tid, reason="David: tap Reply timing", kind="needs_input")
++    assert kb.get_task(conn, tid).status == "triage"
++
++
++def test_block_loop_escalation_counts_as_waiting_on_user(kanban_home):
++    from hermes_cli import kanban_diagnostics as kd
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="loop", assignee="a")
++        _escalate(conn, tid)
++        child = kb.create_task(conn, title="child", assignee="a", parents=[tid])
++        assert kb.get_task(conn, child).status == "todo"
++
++        stats = kb.board_stats(conn)
++        assert stats["waiting_on_user"] >= 1
++        assert tid in stats["waiting_on_user_ids"]
++
++        diags = kd.compute_task_diagnostics(kb.get_task(conn, tid), kb.list_events(conn, tid),
++                                            kb.list_runs(conn, tid), graph=kb.task_graph_context(conn, tid))
++        assert "escalated_waiting_on_user" in [d.kind for d in diags]
++        cdiags = kd.compute_task_diagnostics(kb.get_task(conn, child), kb.list_events(conn, child),
++                                             kb.list_runs(conn, child), graph=kb.task_graph_context(conn, child))
++        assert "waiting_behind_user" in [d.kind for d in cdiags]
++
++
++def test_plain_triage_card_is_not_waiting_on_user(kanban_home):
++    with kbc.connect() as conn:
++        tid = kb.create_task(conn, title="spec me", assignee="a", triage=True)
++        assert kb.get_task(conn, tid).status == "triage"
++        assert tid not in kb.board_stats(conn)["waiting_on_user_ids"]
++
++
++# ---------------------------------------------------------------------------
++# 5. Top-level launches strip a leaked worker env
++# ---------------------------------------------------------------------------
++
++LEAK = {
++    "HERMES_DELEGATED_CHILD_CONTEXT": "/Users/x/.hermes",
++    "HERMES_KANBAN_WORKSPACE": "/Users/x/.hermes/kanban/workspaces/t_45d5a361",
++    "HERMES_KANBAN_DB": "/Users/x/.hermes/kanban.db",
++    "HERMES_KANBAN_BOARD": "default",
++    "HERMES_KANBAN_WORKSPACES_ROOT": "/Users/x/.hermes/kanban/workspaces",
++}
++
++
++def test_scrub_removes_leaked_worker_env():
++    from hermes_cli.top_level_env import scrub_leaked_worker_env
++    env = {"PATH": "/bin", **LEAK, "HERMES_KANBAN_TASK": "t_1"}
++    removed = scrub_leaked_worker_env(env)
++    assert env == {"PATH": "/bin"}
++    assert set(removed) == set(LEAK) | {"HERMES_KANBAN_TASK"}
++
++
++def test_scrub_keeps_deliberate_board_pin_without_worker_marker():
++    from hermes_cli.top_level_env import scrub_leaked_worker_env
++    env = {"HERMES_KANBAN_DB": "/tmp/test.db", "HERMES_KANBAN_BOARD": "x"}
++    assert scrub_leaked_worker_env(env) == []
++    assert env == {"HERMES_KANBAN_DB": "/tmp/test.db", "HERMES_KANBAN_BOARD": "x"}
++
++
++@pytest.mark.parametrize("argv, scrubbed", [
++    (["serve"], True), (["dashboard"], True), (["desktop"], True), (["gateway", "run"], True),
++    (["chat"], False), (["kanban", "list"], False),
++])
++def test_main_scrubs_for_top_level_surfaces(monkeypatch, argv, scrubbed):
++    from hermes_cli import top_level_env
++    for k, v in LEAK.items():
++        monkeypatch.setenv(k, v)
++    top_level_env.scrub_for_top_level_launch(argv)
++    import os
++    assert ("HERMES_DELEGATED_CHILD_CONTEXT" not in os.environ) is scrubbed
++
++
++def test_desktop_relaunch_after_update_gets_scrubbed_env(monkeypatch, tmp_path):
++    """``hermes update`` run from a worker reopens Desktop with ``open``; the app must not
++    inherit the worker's kanban/delegation env (Hermes.app pid 59331, 2026-10-21)."""
++    from hermes_cli import main_desktop as md
++    for k, v in LEAK.items():
++        monkeypatch.setenv(k, v)
++    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_45d5a361")
++    exe = tmp_path / "Hermes.app" / "Contents" / "MacOS" / "Hermes"
++    exe.parent.mkdir(parents=True)
++    exe.write_text("")
++    monkeypatch.setattr(md, "_desktop_packaged_executable", lambda d: exe)
++    monkeypatch.setattr(md, "_desktop_relaunch_after_rebuild_enabled", lambda: True)
++    monkeypatch.setattr(md.sys, "platform", "darwin")
++    calls = []
++    monkeypatch.setattr(md.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
++    md._relaunch_stopped_desktops(tmp_path, [[]])
++    assert calls, "desktop was not reopened"
++    env = calls[0][1].get("env")
++    assert env is not None
++    assert not ({"HERMES_KANBAN_TASK", *LEAK} & set(env))
+diff --git a/tests/hermes_cli/test_kanban_timed_park.py b/tests/hermes_cli/test_kanban_timed_park.py
+index 0fee76542c..bf2937cf77 100644
+--- a/tests/hermes_cli/test_kanban_timed_park.py
++++ b/tests/hermes_cli/test_kanban_timed_park.py
+@@ -88,10 +88,12 @@ def test_kanban_schedule_marker_becomes_a_real_timer(kanban_home: Path) -> None:
+         assert kb.schedule_task(conn, tid, reason="SCHEDULED_UNTIL=2000-01-01T00:00:00Z")
+         due = _last(conn, tid, "scheduled")["wake_at"]
+         assert kc.wake_due_continuations(conn, now=due) == [tid]
+-        # No marker -> no timer (left for a cron/human, as before).
++        # No marker -> the default wait, never "forever" (a deleted cron stranded cards). [daveey]
+         tid2 = _running(conn)
+         assert kb.schedule_task(conn, tid2, reason="waiting on Rose")
+-        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10**7) == []
++        assert _last(conn, tid2, "scheduled")["wake_at"] >= int(time.time()) + ktp.DEFAULT_WAKE_SECONDS - 5
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 3600) == []
++        assert kc.wake_due_continuations(conn, now=int(time.time()) + 10**7) == [tid2]
+ 
+ 
+ def test_needs_input_without_marker_still_blocks_for_a_human(kanban_home: Path) -> None:
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 59d32bdf48..966950a86e 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -995,7 +995,8 @@ def _handle_schedule(args: dict, **kw) -> str:
+                "the wake), or kanban_complete so the completion judge can evaluate it.")
+         ok = kb.schedule_task(
+             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
+-        _check(ok, f"could not schedule {tid} (unknown id or not in todo/ready/running/blocked)")
++        _check(ok, f"could not schedule {tid} (unknown id, not in todo/ready/running/blocked, or it "
++                   "waits on a human answer: needs_input/capability asks stay blocked, never scheduled)")
+         return _ok_landed(kb, conn, tid, "scheduled", reason=reason)
+ 
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,45 @@
+From 75ca1af9cbe360ef2a056f0e9fe950219f7989ab Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 06:31:54 +0000
+Subject: [PATCH] test(git_pack_tidy): skip --incremental midx case on git <
+ 2.47 [daveey]
+
+---
+ tests/hermes_cli/test_git_pack_tidy.py | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/tests/hermes_cli/test_git_pack_tidy.py b/tests/hermes_cli/test_git_pack_tidy.py
+index b408d43cda..611b8dd1fd 100644
+--- a/tests/hermes_cli/test_git_pack_tidy.py
++++ b/tests/hermes_cli/test_git_pack_tidy.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import os
++import re
+ import subprocess
+ import sys
+ import time
+@@ -148,7 +149,18 @@ tidy.tidy_partial_clone_packs(Path(sys.argv[1]))
+ """
+ 
+ 
+-@pytest.mark.parametrize("midx_layout", [[], ["--incremental"]])
++def _git_supports_incremental_midx() -> bool:
++    """`multi-pack-index write --incremental` arrived in git 2.47; older runners exit 129 (usage)."""
++    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
++    m = re.search(r"(\d+)\.(\d+)", out)
++    return bool(m) and (int(m[1]), int(m[2])) >= (2, 47)
++
++
++@pytest.mark.parametrize("midx_layout", [
++    [],
++    pytest.param(["--incremental"], marks=pytest.mark.skipif(
++        not _git_supports_incremental_midx(), reason="git < 2.47 has no multi-pack-index --incremental")),
++])
+ def test_a_refused_or_killed_erase_leaves_git_reading_and_is_finished_later(
+         clone: Path, monkeypatch: pytest.MonkeyPatch, midx_layout: list) -> None:
+     pack_dir = clone / ".git" / "objects" / "pack"
+-- 
+2.54.0 (Apple Git-157)
+

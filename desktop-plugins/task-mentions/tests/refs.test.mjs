@@ -58,3 +58,17 @@ test('openCard falls back to the board page on a core without the hook', async (
   assert.equal(await m.openCard('t_1a2b3c4d', { board: 'bb', conn: 'local' }, {}, nav), false)
   assert.deepEqual(seen, ['/kanban', 'info'])
 })
+
+test('scheduled (timer-blocked) status pill is yellow', () => {
+  assert.equal(m.statusColor('scheduled'), '#e3b341')
+  assert.equal(m.statusColor('blocked'), '#f85149')
+})
+
+test('sessionTarget prefers the run worker session, labels the creator fallback, hides the focused chat', () => {
+  const d = { task: { session_id: 'creator', current_run_id: 2 }, runs: [{ id: 1, worker_session_id: 'old' }, { id: 2, worker_session_id: 'w2' }] }
+  assert.deepEqual(m.sessionTarget(d, 'creator'), { id: 'w2', label: 'Open worker session' })
+  assert.equal(m.sessionTarget(d, 'w2'), null)
+  assert.deepEqual(m.sessionTarget({ task: { session_id: 'creator' }, runs: [{ id: 1 }] }, 'other'), { id: 'creator', label: 'Open creating chat' })
+  assert.equal(m.sessionTarget({ task: { session_id: 'creator' }, runs: [] }, 'creator'), null)
+  assert.deepEqual(m.sessionTarget({ task: { session_id: 'c', current_run_id: 3 }, runs: [{ id: 1, worker_session_id: 'a' }, { id: 3 }] }, ''), { id: 'a', label: 'Open worker session' })
+})

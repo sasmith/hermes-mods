@@ -1,0 +1,457 @@
+From 7ea8e970360e13e74d1051b18a37bce54a6d7e60 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 05:58:06 +0000
+Subject: [PATCH] ci: run Linux CI on self-hosted hermes-hub runners [daveey]
+
+* ci: run Linux CI jobs on self-hosted hermes-hub runners, skip mac/win lane [daveey]
+
+* ci: keep tests-os wired (test_update_ci_routing asserts it) [daveey]
+
+* ci: keep tests-os wired [daveey]
+
+* ci: retrigger on rebuilt runners [daveey]
+---
+ .github/workflows/blob-size-check.yml        |  2 +-
+ .github/workflows/bootstrap-installer.yml    |  2 +-
+ .github/workflows/case-collision-check.yml   |  2 +-
+ .github/workflows/ci.yaml                    |  6 +++---
+ .github/workflows/contributor-check.yml      |  2 +-
+ .github/workflows/docker-lint.yml            |  2 +-
+ .github/workflows/docs-site-checks.yml       |  2 +-
+ .github/workflows/e2e-desktop-core.yml       |  2 +-
+ .github/workflows/e2e-desktop-update.yml     |  2 +-
+ .github/workflows/history-check.yml          |  2 +-
+ .github/workflows/icons-freshness-check.yml  |  2 +-
+ .github/workflows/infographic-check.yml      |  2 +-
+ .github/workflows/js-tests.yml               |  2 +-
+ .github/workflows/lazy-deps-guard.yml        |  2 +-
+ .github/workflows/lint.yml                   |  8 ++++----
+ .github/workflows/lockfile-diff.yml          |  2 +-
+ .github/workflows/profile-artifact-check.yml |  2 +-
+ .github/workflows/prompt-surface-diff.yml    |  2 +-
+ .github/workflows/remote-backends.yml        |  2 +-
+ .github/workflows/rust-tests.yml             |  2 +-
+ .github/workflows/supply-chain-audit.yml     |  6 +++---
+ .github/workflows/tests.yml                  |  8 ++++----
+ .github/workflows/uv-lockfile-check.yml      |  2 +-
+ scripts/fork-ci-runner.sh                    | 19 +++++++++++++++++++
+ 24 files changed, 52 insertions(+), 33 deletions(-)
+ create mode 100755 scripts/fork-ci-runner.sh
+
+diff --git a/.github/workflows/blob-size-check.yml b/.github/workflows/blob-size-check.yml
+index db53dc165f..608ca0c4d1 100644
+--- a/.github/workflows/blob-size-check.yml
++++ b/.github/workflows/blob-size-check.yml
+@@ -21,7 +21,7 @@ permissions:
+ jobs:
+   check-blob-size:
+     name: Reject large binaries
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/bootstrap-installer.yml b/.github/workflows/bootstrap-installer.yml
+index 127f6c7a53..485d0cbcd0 100644
+--- a/.github/workflows/bootstrap-installer.yml
++++ b/.github/workflows/bootstrap-installer.yml
+@@ -21,7 +21,7 @@ concurrency:
+ jobs:
+   posix:
+     name: install.sh protocol + small fresh-install E2E
+-    runs-on: ubuntu-24.04
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     # NOTE: `runner.temp` is only available in step-level env, not job-level
+     # env — a job-env `${{ runner.temp }}` makes GitHub reject the workflow
+diff --git a/.github/workflows/case-collision-check.yml b/.github/workflows/case-collision-check.yml
+index b4dfe03f80..fc67cfe61e 100644
+--- a/.github/workflows/case-collision-check.yml
++++ b/.github/workflows/case-collision-check.yml
+@@ -24,7 +24,7 @@ permissions:
+ 
+ jobs:
+   check-case-collisions:
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/ci.yaml b/.github/workflows/ci.yaml
+index 834fd9ce67..c5babbaac0 100644
+--- a/.github/workflows/ci.yaml
++++ b/.github/workflows/ci.yaml
+@@ -66,7 +66,7 @@ jobs:
+   # ─────────────────────────────────────────────────────────────────────
+   detect:
+     name: Detect affected areas
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 1
+     outputs:
+       python: ${{ steps.gate-lanes.outputs.python }}
+@@ -395,7 +395,7 @@ jobs:
+       # to block a merge. A separate run also stops it from holding this
+       # run open. That is what blocked ``gh run rerun``.
+     if: always()
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     outputs:
+       needs-json: ${{ steps.evaluate.outputs.needs-json }}
+@@ -430,7 +430,7 @@ jobs:
+     name: CI timing report
+     needs: [all-checks-pass]
+     if: always()
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     steps:
+       - name: Checkout code
+diff --git a/.github/workflows/contributor-check.yml b/.github/workflows/contributor-check.yml
+index c6ccaf3ac7..8013a3d340 100644
+--- a/.github/workflows/contributor-check.yml
++++ b/.github/workflows/contributor-check.yml
+@@ -12,7 +12,7 @@ permissions:
+ 
+ jobs:
+   check-attribution:
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     outputs:
+       review_status: ${{ steps.check-emails.outputs.review_status }}
+diff --git a/.github/workflows/docker-lint.yml b/.github/workflows/docker-lint.yml
+index 8f3fca5797..328de83779 100644
+--- a/.github/workflows/docker-lint.yml
++++ b/.github/workflows/docker-lint.yml
+@@ -23,7 +23,7 @@ concurrency:
+ jobs:
+   lint-docker-and-shell:
+     name: Lint Dockerfile (hadolint)
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - name: Checkout code
+diff --git a/.github/workflows/docs-site-checks.yml b/.github/workflows/docs-site-checks.yml
+index d502e2e328..ca50345f19 100644
+--- a/.github/workflows/docs-site-checks.yml
++++ b/.github/workflows/docs-site-checks.yml
+@@ -8,7 +8,7 @@ permissions:
+ 
+ jobs:
+   docs-site-checks:
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 20
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/e2e-desktop-core.yml b/.github/workflows/e2e-desktop-core.yml
+index 16b9b329c2..199cd19171 100644
+--- a/.github/workflows/e2e-desktop-core.yml
++++ b/.github/workflows/e2e-desktop-core.yml
+@@ -24,7 +24,7 @@ concurrency:
+ jobs:
+   core:
+     name: Desktop core E2E (Linux)
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/e2e-desktop-update.yml b/.github/workflows/e2e-desktop-update.yml
+index a84971f334..904d59e8eb 100644
+--- a/.github/workflows/e2e-desktop-update.yml
++++ b/.github/workflows/e2e-desktop-update.yml
+@@ -26,7 +26,7 @@ concurrency:
+ jobs:
+   update:
+     name: Desktop install/update E2E (Linux, ${{ matrix.cell }})
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     # Required whenever the e2e_desktop_update lane fires (see ci.yaml): it was
+     # advisory until it proved stable, and every main push shard since has passed.
+diff --git a/.github/workflows/history-check.yml b/.github/workflows/history-check.yml
+index 8ba149e60e..709bce9fc9 100644
+--- a/.github/workflows/history-check.yml
++++ b/.github/workflows/history-check.yml
+@@ -25,7 +25,7 @@ permissions:
+ 
+ jobs:
+   check-common-ancestor:
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     outputs:
+       review_status: ${{ steps.merge-base-check.outputs.review_status }}
+diff --git a/.github/workflows/icons-freshness-check.yml b/.github/workflows/icons-freshness-check.yml
+index 1f451b0138..1c68b52744 100644
+--- a/.github/workflows/icons-freshness-check.yml
++++ b/.github/workflows/icons-freshness-check.yml
+@@ -21,7 +21,7 @@ permissions:
+ jobs:
+   check:
+     name: Regenerate icons + diff against committed
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/infographic-check.yml b/.github/workflows/infographic-check.yml
+index eb01e7be15..f401b97c48 100644
+--- a/.github/workflows/infographic-check.yml
++++ b/.github/workflows/infographic-check.yml
+@@ -28,7 +28,7 @@ permissions:
+ 
+ jobs:
+   check-no-committed-infographics:
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     outputs:
+       review_status: ${{ steps.infographic-check.outputs.review_status }}
+diff --git a/.github/workflows/js-tests.yml b/.github/workflows/js-tests.yml
+index c8da4799ae..06e634f0aa 100644
+--- a/.github/workflows/js-tests.yml
++++ b/.github/workflows/js-tests.yml
+@@ -14,7 +14,7 @@ jobs:
+     #
+     # One larger runner installs one time. vitest, tsc and eslint each size
+     # their own worker pool from the core count.
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/lazy-deps-guard.yml b/.github/workflows/lazy-deps-guard.yml
+index a78fae82c9..27c69e5517 100644
+--- a/.github/workflows/lazy-deps-guard.yml
++++ b/.github/workflows/lazy-deps-guard.yml
+@@ -28,7 +28,7 @@ permissions:
+ jobs:
+   lazy-deps-guard:
+     name: No production imports of the tools.lazy_deps stub
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/lint.yml b/.github/workflows/lint.yml
+index 9b399ebc0a..6ea75f65ea 100644
+--- a/.github/workflows/lint.yml
++++ b/.github/workflows/lint.yml
+@@ -35,7 +35,7 @@ jobs:
+   lint-diff:
+     name: ruff + ty diff
+     if: inputs.event_name == 'pull_request' && inputs.python
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     steps:
+       - name: Checkout code
+@@ -141,7 +141,7 @@ jobs:
+     # the diff comment even when enforcement fails.
+     name: ruff enforcement (blocking)
+     if: inputs.python
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - name: Checkout code
+@@ -177,7 +177,7 @@ jobs:
+     # parent (current main), so an improvement that lands on main is locked in at once.
+     name: code health ratchet (blocking)
+     if: inputs.event_name == 'pull_request'
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 10
+     steps:
+       - name: Checkout code
+@@ -212,7 +212,7 @@ jobs:
+     # See scripts/check-windows-footguns.py for the full rule list.
+     name: Windows footguns (blocking)
+     if: inputs.python
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - name: Checkout code
+diff --git a/.github/workflows/lockfile-diff.yml b/.github/workflows/lockfile-diff.yml
+index f7ccb41dd4..8cdf52beab 100644
+--- a/.github/workflows/lockfile-diff.yml
++++ b/.github/workflows/lockfile-diff.yml
+@@ -34,7 +34,7 @@ concurrency:
+ jobs:
+   diff:
+     name: package-lock.json semantic diff
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     outputs:
+       changed: ${{ steps.diff.outputs.changed }}
+diff --git a/.github/workflows/profile-artifact-check.yml b/.github/workflows/profile-artifact-check.yml
+index e444b18e31..10f07af6e8 100644
+--- a/.github/workflows/profile-artifact-check.yml
++++ b/.github/workflows/profile-artifact-check.yml
+@@ -13,7 +13,7 @@ permissions:
+ jobs:
+   check-profile-artifacts:
+     name: Reject profile archives
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     steps:
+       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+diff --git a/.github/workflows/prompt-surface-diff.yml b/.github/workflows/prompt-surface-diff.yml
+index 6f80bdf25b..484abc0b8a 100644
+--- a/.github/workflows/prompt-surface-diff.yml
++++ b/.github/workflows/prompt-surface-diff.yml
+@@ -34,7 +34,7 @@ concurrency:
+ jobs:
+   diff:
+     name: Prompt surface summary
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     outputs:
+       changed: ${{ steps.diff.outputs.changed }}
+diff --git a/.github/workflows/remote-backends.yml b/.github/workflows/remote-backends.yml
+index d7ad38b8a8..c49108a1bb 100644
+--- a/.github/workflows/remote-backends.yml
++++ b/.github/workflows/remote-backends.yml
+@@ -31,7 +31,7 @@ env:
+ jobs:
+   real-backends:
+     name: SSH + Docker backends (real sshd, real daemon)
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     steps:
+       - name: Checkout code
+diff --git a/.github/workflows/rust-tests.yml b/.github/workflows/rust-tests.yml
+index 0c4c4e79fc..3bc2c4a468 100644
+--- a/.github/workflows/rust-tests.yml
++++ b/.github/workflows/rust-tests.yml
+@@ -30,7 +30,7 @@ jobs:
+     # cargo builds codegen units and test binaries in parallel across the
+     # cores. This lane also builds the crate from the start when Cargo.toml
+     # changes.
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     defaults:
+       run:
+diff --git a/.github/workflows/supply-chain-audit.yml b/.github/workflows/supply-chain-audit.yml
+index 8f4cd85126..2cea7ac89f 100644
+--- a/.github/workflows/supply-chain-audit.yml
++++ b/.github/workflows/supply-chain-audit.yml
+@@ -51,7 +51,7 @@ jobs:
+   scan:
+     name: Scan PR for critical supply chain risks
+     if: inputs.scan
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     outputs:
+       review_status: ${{ steps.emit-status.outputs.review_status }}
+@@ -154,7 +154,7 @@ jobs:
+   dep-bounds:
+     name: Check PyPI dependency upper bounds
+     if: inputs.deps
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     outputs:
+       review_status: ${{ steps.emit-status.outputs.review_status }}
+@@ -233,7 +233,7 @@ jobs:
+     name: Aggregate review statuses
+     needs: [scan, dep-bounds]
+     if: always()
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 15
+     outputs:
+       review_status: ${{ steps.merge.outputs.review_status }}
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index cf70c79a36..4bd59fcdb7 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -39,7 +39,7 @@ jobs:
+     # scale linearly. run_tests_parallel.py partitions from the checkout alone, so
+     # both slices agree on the split without a planning job.
+     name: Run tests (${{ matrix.slice }}/2)
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     strategy:
+       fail-fast: false
+@@ -136,7 +136,7 @@ jobs:
+     # The core suites spawn real serve / gateway / tui_gateway / MCP / SQLite
+     # writer processes per test; a 4-vCPU runner serialises them into timeouts.
+     if: inputs.e2e
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 30
+     steps:
+       - name: Checkout code
+@@ -231,7 +231,7 @@ jobs:
+     # carries the whole tree's wall time against the 60-minute timeout.
+     # Skipping this job skips every e2e-upgrade shard with it.
+     if: inputs.e2e_upgrade
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     outputs:
+       shards: ${{ steps.plan.outputs.shards }}
+@@ -274,7 +274,7 @@ jobs:
+     # runs ~5-15 min. Sharded by suite directory (see e2e-upgrade-plan).
+     name: e2e-upgrade (${{ matrix.shard }})
+     needs: e2e-upgrade-plan
+-    runs-on: ubuntu-latest-32-core
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 60
+     strategy:
+       fail-fast: false
+diff --git a/.github/workflows/uv-lockfile-check.yml b/.github/workflows/uv-lockfile-check.yml
+index 8daaab9c00..f5272af5df 100644
+--- a/.github/workflows/uv-lockfile-check.yml
++++ b/.github/workflows/uv-lockfile-check.yml
+@@ -60,7 +60,7 @@ concurrency:
+ jobs:
+   check:
+     name: python -m pm.build_env --source . --check-lock
+-    runs-on: ubuntu-latest
++    runs-on: [self-hosted, hermes-hub]
+     timeout-minutes: 5
+     outputs:
+       review_status: ${{ steps.verify.outputs.review_status }}
+diff --git a/scripts/fork-ci-runner.sh b/scripts/fork-ci-runner.sh
+new file mode 100755
+index 0000000000..8d4e481a10
+--- /dev/null
++++ b/scripts/fork-ci-runner.sh
+@@ -0,0 +1,19 @@
++#!/usr/bin/env bash
++# [daveey] fork-only: run the Linux jobs of CI on the self-hosted hermes-hub
++# runners (hosts/hermes-hub/gh-runner) because the private fork has no
++# GitHub-hosted minutes. Idempotent; re-run after merging upstream:
++#   scripts/fork-ci-runner.sh && git commit -am "ci: re-point runners [daveey]"
++# Leaves macOS/Windows/arm and ${{ matrix.* }} runners alone (tests-os stays
++# red on the fork: tests/ci/test_update_ci_routing.py asserts its wiring).
++set -euo pipefail
++cd "$(dirname "$0")/../.github/workflows"
++FILES=(ci.yaml tests.yml lint.yml js-tests.yml rust-tests.yml remote-backends.yml
++  bootstrap-installer.yml e2e-desktop-core.yml e2e-desktop-update.yml
++  docs-site-checks.yml history-check.yml contributor-check.yml
++  uv-lockfile-check.yml infographic-check.yml profile-artifact-check.yml
++  icons-freshness-check.yml case-collision-check.yml blob-size-check.yml
++  lazy-deps-guard.yml lockfile-diff.yml prompt-surface-diff.yml
++  docker-lint.yml supply-chain-audit.yml)
++sed -i.bak -E 's/^([[:space:]]*runs-on:[[:space:]]*)(ubuntu-latest(-32-core)?|ubuntu-24\.04)[[:space:]]*$/\1[self-hosted, hermes-hub]/' "${FILES[@]}"
++rm -f ./*.bak
++
+-- 
+2.54.0 (Apple Git-157)
+

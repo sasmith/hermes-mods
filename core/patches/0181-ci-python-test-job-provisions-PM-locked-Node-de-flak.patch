@@ -1,0 +1,60 @@
+From 09b944087814d8b2129480ff9b9c0971587c0316 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 07:13:58 +0000
+Subject: [PATCH] ci: python test job provisions PM-locked Node; de-flake
+ restart-survival pid read and compute_host hello timeout [daveey] (#7)
+
+---
+ .github/workflows/tests.yml                      | 5 +++++
+ tests/hermes_cli/test_kanban_restart_survival.py | 4 +++-
+ tests/tui_gateway/test_compute_host.py           | 3 ++-
+ 3 files changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/.github/workflows/tests.yml b/.github/workflows/tests.yml
+index 4bd59fcdb7..a08567431f 100644
+--- a/.github/workflows/tests.yml
++++ b/.github/workflows/tests.yml
+@@ -66,6 +66,11 @@ jobs:
+       - name: Set up locked Python and test dependencies
+         uses: ./.github/actions/setup-pm
+         with:
++          # Several python tests shell out to node (desktop backend-child .ts,
++          # msix-shared.mjs, update handoff). Self-hosted runners only have
++          # apt's Node 18, which cannot strip .ts or require() ESM; use the
++          # PM-locked Node like the e2e job does.
++          toolchain: all
+           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+           test-environment: 'true'
+           prune-python-cache: true
+diff --git a/tests/hermes_cli/test_kanban_restart_survival.py b/tests/hermes_cli/test_kanban_restart_survival.py
+index 535fc06007..70fd2c34fb 100644
+--- a/tests/hermes_cli/test_kanban_restart_survival.py
++++ b/tests/hermes_cli/test_kanban_restart_survival.py
+@@ -83,7 +83,9 @@ while True: time.sleep(1)
+     pid = None
+     try:
+         wait_for(lambda: (tmp_path / 'parent-ready').exists())
+-        wait_for(lambda: (tmp_path / 'worker-ready').exists())
++        # write_text truncates before it writes; wait for the pid, not the file.
++        wait_for(lambda: (tmp_path / 'worker-ready').exists()
++                 and (tmp_path / 'worker-ready').read_text().strip().isdigit())
+         pid = int((tmp_path / 'worker-ready').read_text())
+         assert os.getpgid(pid) != os.getpgid(parent.pid)
+         with kbc.connect_closing(board) as conn:
+diff --git a/tests/tui_gateway/test_compute_host.py b/tests/tui_gateway/test_compute_host.py
+index 2156ef385d..96a7610dd9 100644
+--- a/tests/tui_gateway/test_compute_host.py
++++ b/tests/tui_gateway/test_compute_host.py
+@@ -45,7 +45,8 @@ def test_compute_host_line_json_hello_and_shutdown():
+     assert proc.stdin is not None
+     out = _stdout_queue(proc)
+     try:
+-        hello = _read_json_line(out)
++        # Cold import of tui_gateway.server on a loaded runner exceeds 2s.
++        hello = _read_json_line(out, timeout=30.0)
+         assert hello["type"] == "hello"
+         assert hello["host_pid"] == proc.pid
+ 
+-- 
+2.54.0 (Apple Git-157)
+

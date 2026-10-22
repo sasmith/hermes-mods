@@ -33,8 +33,35 @@ Two `post_tool_call` hooks. Neither one blocks or changes a tool call, and every
 
 Log: `~/.hermes/logs/worktree-owner.log` (`REGISTER`, `REMOVED`, `KEEP`, `SKIP` lines).
 
-Not covered: worktrees made outside Hermes (Claude Code, Codex, plain shells). Those need the backstop GC plus
-agent instructions ("remove the worktree you made once its branch is merged or abandoned").
+## Claude Code and Codex (`agent_hook.py`)
+
+The same rule for worktrees made by Claude Code or Codex sessions (and their subagents), as command hooks:
+
+- `PreToolUse` / `PostToolUse` on Bash: a command that mentions `worktree add` gets the same `hermes-owner.json`
+  marker, with `agent` (`claude` / `codex`), `agent_session_id`, `cwd` and, inside a Kanban card,
+  `task_id` (so the card's `kanban_complete` teardown also applies). The pre-hook stamps the call's start time, so
+  only gitdirs born during the call are claimed, with the same attribution guard. Repos searched: `~/code` depth
+  1-2, `~/.hermes/hermes-agent`, the session cwd and any `cd <dir>` / `git -C <dir>` in the command.
+- `Stop` (at most every 5 min per session) and `SessionEnd`: a detached child removes this session's marked trees
+  that are clean, have no live process cwd inside, and are merged: HEAD is an ancestor of `origin/<default>` after a
+  fetch, or a merged GitHub PR (`gh pr list --head <branch> --state merged`) has exactly HEAD as its head (squash
+  merges, auto-deleted branches). The branch is kept. Unmerged, dirty or busy trees are left to the backstop GC.
+
+`~/.claude/settings.json`:
+
+```json
+"PreToolUse":  [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 ~/.hermes/plugins/worktree-owner/agent_hook.py claude", "timeout": 10}]}],
+"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "python3 ~/.hermes/plugins/worktree-owner/agent_hook.py claude", "timeout": 30}]}],
+"Stop":        [{"hooks": [{"type": "command", "command": "python3 ~/.hermes/plugins/worktree-owner/agent_hook.py claude", "timeout": 10}]}],
+"SessionEnd":  [{"hooks": [{"type": "command", "command": "python3 ~/.hermes/plugins/worktree-owner/agent_hook.py claude", "timeout": 10}]}]
+```
+
+Codex: the same entries in `~/.codex/hooks.json` with `agent_hook.py codex` (proven with `codex exec`). Codex runs a
+new hook only once it is trusted (it records a `trusted_hash` per hook in `config.toml`); until then only `codex exec
+--dangerously-bypass-hook-trust` runs it.
+
+Not covered: worktrees made by plain shells or other tools. Those need the backstop GC plus agent instructions
+("remove the worktree you made once its branch is merged or abandoned").
 
 ## Install
 

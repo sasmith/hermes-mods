@@ -1,6 +1,6 @@
 ---
 name: local-chrome-remote-debugging
-description: "Use when driving or handing off the agent's macOS Chrome."
+description: "Use when driving or handing off the agent's Chrome/VNC."
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -71,6 +71,32 @@ and on replies that ask for browser action); call the tool anyway when asking.
 3. Raise the app: JXA `$.NSRunningApplication.runningApplicationWithProcessIdentifier(pid).activateWithOptions(3)`
    via `osascript -l JavaScript`. It needs no Accessibility grant, unlike System Events.
 4. Verify with `$.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier`.
+
+When the driven browser is on another host behind a password-protected VNC/noVNC
+viewer, put the VNC password on the user's clipboard before opening the viewer,
+every time; the user should never have to look it up. Read it from the host over
+ssh, feed it to `pbcopy` on stdin (never argv, logs or chat), notify "paste with
+⌘V", and clear the clipboard after ~2 min only if it still holds the password.
+If the host already has an opener helper that does this (check its host docs), use
+it instead of a bare `open <url>`. Also put the password in the same chat message
+and in the link (`vnc.html?autoconnect=1&resize=scale&password=<pw>`): a link alone,
+or a password only inside a rendered user-step card, leaves the user unable to connect.
+x11vnc `-rfbauth` files are DES-obfuscated with VNC's fixed key and only the first 8
+chars count: `head -c8 <file> | openssl enc -d -des-ecb -K e84ad660c4721ae0 -nopad
+-provider legacy -provider default | tr -d '\0'`.
+
+Before handing sign-ins to the user, do every one you can yourself: if the driven
+browser already holds a Google session, click the site's "Continue with Google" and
+pick the account (the work-domain address for workspace-bound services like Slack;
+the personal one is rejected as "no account on this workspace"). Hand over only what
+needs the user's devices (Apple ID 2FA, passkeys). When something is handed over, say
+what is blocked and why, then numbered steps naming the exact window, what to do, and
+what happens next; a list of links without that leaves the user asking what you want.
+
+When the user says they signed in but a login check still fails, inspect before
+reporting it dead: list the site's cookies (`Storage.getCookies`) and load its
+`/signin` URL — a redirect to the account home means the session is live and the
+check's selector is wrong (pages render the email/name lazily); fix the check.
 
 The driven browser is a separate profile copy, so a user who says "signed in" while
 the driven tab still shows the sign-in page probably signed in to their everyday
@@ -150,6 +176,17 @@ Or in Python: `urllib.request.urlopen('http://127.0.0.1:9222/json/list')`.
   of starting a new debugging listener. Reuse a working CDP attachment first; if a
   restart is necessary, get permission and quit gracefully so open user work is
   not lost. Sharing the Chrome executable alone is not proof of a profile conflict.
+
+- **One wedged tab blocks every evaluate on it.** If `Runtime.evaluate` times out
+  on a target while `/json/list` still answers, that renderer is hung; don't retry it.
+  `GET /json/close/<id>`, then `PUT /json/new?<url>` and drive the new id. Raw
+  `websocket.create_connection` to the page needs `suppress_origin=True`.
+
+- **Check focus before `Input.insertText`.** It types into whatever is focused, so a
+  site's global search box can swallow text meant for a form field. Focus the target
+  by clicking its center (`Input.dispatchMouseEvent`), read back `.value`, and only
+  then press Send. It also appends to a prefilled field (sites pre-fill the email
+  from the last account), so select-all + Backspace before inserting.
 
 - **`open -a` may find a stale/broken .app.** If you created a test .app in
   `/Applications/` with a malformed Info.plist, remove it before relying on

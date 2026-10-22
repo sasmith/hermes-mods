@@ -1,0 +1,173 @@
+From 9599f3135a651d8f033e6df2ffac9c5993e2c2c0 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 23:25:41 -0700
+Subject: [PATCH] fix(cli): chat -c <title> --create-if-missing honors --source
+ / inherited automation source [daveey]
+
+_create_titled_session hardcoded source='cli', so integration threads created with
+--source tool (e.g. Slack mac-ops turns) were labelled normal user chats and listed
+in the Desktop sidebar. Now --source wins, else an inherited non-UI
+HERMES_SESSION_SOURCE (tui/desktop leaks ignored unless explicit), else 'cli'.
+Resuming keeps the row's source (the session upsert never overwrites it).
+---
+ hermes_cli/main.py                          | 33 +++++++-
+ tests/hermes_cli/test_chat_c_fail_loudly.py | 86 +++++++++++++++++++++
+ 2 files changed, 116 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index 80c580a07b..d38f86eff6 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -1374,9 +1374,36 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
+     return None
+ 
+ 
+-def _create_titled_session(title: str) -> Optional[str]:
++def _titled_session_source(explicit: Optional[str] = None) -> str:
++    """Source label for a ``chat -c <title> --create-if-missing`` row. [daveey]
++
++    ``--source`` wins; else an inherited ``HERMES_SESSION_SOURCE`` (automation labels such as
++    ``tool``/``kanban``/``cron`` are inherited on purpose, but a ``tui``/``desktop`` label leaked
++    from a parent UI session is not, unless marked explicit — same rule as
++    ``agent.session_source.session_source_for``); else ``cli``. Without this every
++    create-if-missing row was ``cli`` = a normal user chat in the Desktop sidebar, even for
++    ``--source tool`` integrations.
++    """
++    source = str(explicit or "").strip()
++    if source:
++        return source
++    source = str(os.environ.get("HERMES_SESSION_SOURCE", "") or "").strip()
++    if source:
++        try:
++            from agent.session_source import UI_TRANSPORT_SOURCES
++        except Exception:
++            UI_TRANSPORT_SOURCES = frozenset({"tui", "desktop"})
++        explicit_env = os.environ.get("HERMES_SESSION_SOURCE_EXPLICIT", "") == "1"
++        if source not in UI_TRANSPORT_SOURCES or explicit_env:
++            return source
++    return "cli"
++
++
++def _create_titled_session(title: str, source: Optional[str] = None) -> Optional[str]:
+     """Create a fresh titled session (``chat -c <title> --create-if-missing``).
+ 
++    ``source`` (from ``--source``) labels the row; see :func:`_titled_session_source`. [daveey]
++
+     Same timestamp+uuid id shape the CLI uses; the title is recorded with
+     user provenance so auto-titling never overwrites it.
+ 
+@@ -1393,7 +1420,7 @@ def _create_titled_session(title: str) -> Optional[str]:
+         # The CLI acquires the registry handle for this same path moments later; share it
+         # instead of minting a second writer for one INSERT (close() releases the refcount).
+         db = acquire()
+-        db.create_session(new_session_id, source="cli")
++        db.create_session(new_session_id, source=_titled_session_source(source))
+         db.set_session_title(new_session_id, title)
+         return new_session_id
+     except Exception:
+@@ -1432,7 +1459,7 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
+                 # a quiet send to a not-yet-existing session silently no-ops.
+                 # --create-if-missing: no session matches the title — create a new session with that title
+                 # and proceed. See #86794.
+-                new_sid = _create_titled_session(continue_val)
++                new_sid = _create_titled_session(continue_val, source=getattr(args, "source", None))
+                 if new_sid:
+                     args.resume = new_sid
+                 else:
+diff --git a/tests/hermes_cli/test_chat_c_fail_loudly.py b/tests/hermes_cli/test_chat_c_fail_loudly.py
+index 351a8263f7..0f75a2d517 100644
+--- a/tests/hermes_cli/test_chat_c_fail_loudly.py
++++ b/tests/hermes_cli/test_chat_c_fail_loudly.py
+@@ -157,3 +157,89 @@ class TestChatCFailLoudlyOnStderr:
+             assert db.get_session_title(args.resume) == "Bot Chat"
+         finally:
+             db.close()
++
++
++class TestCreateIfMissingSource:
++    """[daveey] `chat -c X --create-if-missing --source tool` labels the new row with that
++    source (was hardcoded 'cli', so integration threads showed as user chats in the sidebar)."""
++
++    @staticmethod
++    def _args(**extra):
++        base = {"continue_last": "Mac-ops C1 1.2", "resume": None, "create_if_missing": True}
++        base.update(extra)
++        return type("Args", (), base)()
++
++    @staticmethod
++    def _source(sid):
++        from hermes_state import SessionDB
++
++        db = SessionDB()
++        try:
++            return db.get_session(sid)["source"]
++        finally:
++            db.close()
++
++    @pytest.fixture(autouse=True)
++    def _clean_env(self, monkeypatch):
++        monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
++        monkeypatch.delenv("HERMES_SESSION_SOURCE_EXPLICIT", raising=False)
++
++    def test_source_flag_labels_created_row(self, isolated_home):
++        import hermes_cli.main as main_mod
++
++        args = self._args(source="tool")
++        main_mod._resolve_continue_arg(args, use_tui=False)
++        assert self._source(args.resume) == "tool"
++
++    def test_real_parser_source_flag_reaches_created_row(self, isolated_home):
++        import hermes_cli.main as main_mod
++        from hermes_cli._parser import build_top_level_parser
++
++        parser, _sub, _chat = build_top_level_parser()
++        args = parser.parse_args(
++            ["chat", "-c", "Mac-ops C1 1.2", "--create-if-missing", "--source", "tool", "-q", "hi"]
++        )
++        args.resume = getattr(args, "resume", None)
++        main_mod._resolve_continue_arg(args, use_tui=False)
++        assert self._source(args.resume) == "tool"
++
++    def test_default_stays_cli(self, isolated_home):
++        import hermes_cli.main as main_mod
++
++        args = self._args()
++        main_mod._resolve_continue_arg(args, use_tui=False)
++        assert self._source(args.resume) == "cli"
++
++    def test_inherited_automation_source_is_used(self, isolated_home, monkeypatch):
++        import hermes_cli.main as main_mod
++
++        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
++        args = self._args()
++        main_mod._resolve_continue_arg(args, use_tui=False)
++        assert self._source(args.resume) == "kanban"
++
++    def test_inherited_ui_source_is_not_used(self, isolated_home, monkeypatch):
++        import hermes_cli.main as main_mod
++
++        monkeypatch.setenv("HERMES_SESSION_SOURCE", "desktop")
++        args = self._args()
++        main_mod._resolve_continue_arg(args, use_tui=False)
++        assert self._source(args.resume) == "cli"
++
++    def test_resume_keeps_tool_source(self, isolated_home):
++        """Second send to the same title resumes the row; the agent's own create_session
++        upsert (source from env, 'cli' fallback) never overwrites the 'tool' label."""
++        import hermes_cli.main as main_mod
++        from hermes_state import SessionDB
++
++        first = self._args(source="tool")
++        main_mod._resolve_continue_arg(first, use_tui=False)
++        second = self._args(source="tool")
++        main_mod._resolve_continue_arg(second, use_tui=False)
++        assert second.resume == first.resume
++        db = SessionDB()
++        try:
++            db.create_session(first.resume, source="cli")
++        finally:
++            db.close()
++        assert self._source(first.resume) == "tool"
+-- 
+2.54.0 (Apple Git-157)
+

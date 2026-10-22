@@ -9,3 +9,5 @@ evidence/
 .extra-runtime/
 .pytest_cache/
 .benchmarks/
+# self-referential symlinks left by `ln -s` into an existing plugin dir
+plugins/*/remote-screen

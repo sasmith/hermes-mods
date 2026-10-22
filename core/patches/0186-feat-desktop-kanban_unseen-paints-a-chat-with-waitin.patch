@@ -1,0 +1,413 @@
+From f040f16b39e948843fc60c48d58141ef0df25c57 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:45:16 -0700
+Subject: [PATCH] feat(desktop): kanban_unseen paints a chat with waiting card
+ results green [daveey]
+
+---
+ apps/desktop/e2e/core/oracle.ts               |  1 +
+ apps/desktop/src/lib/chat-messages.test.ts    | 17 +++++++
+ .../src/lib/chat-messages/hydration.ts        |  8 +++-
+ .../src/lib/session-signatures.test.ts        |  1 +
+ apps/desktop/src/lib/session-signatures.ts    |  1 +
+ .../src/store/session-dot-state.test.ts       | 47 +++++++++++++++++++
+ apps/desktop/src/store/session-dot-state.ts   | 30 +++++++++++-
+ apps/desktop/src/types/hermes.ts              |  7 +++
+ hermes_cli/kanban_session_activity.py         | 47 +++++++++++++++----
+ .../test_kanban_session_activity.py           | 23 +++++++++
+ tests/tui_gateway/test_projects_rpc.py        |  2 +-
+ 11 files changed, 172 insertions(+), 12 deletions(-)
+
+diff --git a/apps/desktop/e2e/core/oracle.ts b/apps/desktop/e2e/core/oracle.ts
+index 60dce933e5..aa64dfafe6 100644
+--- a/apps/desktop/e2e/core/oracle.ts
++++ b/apps/desktop/e2e/core/oracle.ts
+@@ -398,6 +398,7 @@ const NOTICE_KINDS = new Set([
+   'personality_switch',
+   'failed_turn',
+   'turn_stopped',
++  'kanban_notice',
+   'hidden'
+ ])
+ 
+diff --git a/apps/desktop/src/lib/chat-messages.test.ts b/apps/desktop/src/lib/chat-messages.test.ts
+index e7b8eec02a..7595e6ffe3 100644
+--- a/apps/desktop/src/lib/chat-messages.test.ts
++++ b/apps/desktop/src/lib/chat-messages.test.ts
+@@ -562,6 +562,23 @@ describe('toChatMessages', () => {
+     expect(messages.map(chatMessageText)).toEqual(['investigate', 'Stopped by redde', 'turn stopped'])
+   })
+ 
++  it('renders a persisted kanban result as a system line, not a user bubble', () => {
++    // [daveey] The gateway writes `kanban_notice` into a chat no backend had loaded when its card finished.
++    const messages = toChatMessages([
++      { role: 'user', content: 'start the cards', timestamp: 1 },
++      {
++        role: 'user',
++        content: '✔ Kanban t_1 done — shipped',
++        display_kind: 'kanban_notice',
++        display_metadata: { display_text: '✔ Kanban t_1 done — shipped' },
++        timestamp: 2
++      }
++    ])
++
++    expect(messages.map(message => message.role)).toEqual(['user', 'system'])
++    expect(chatMessageText(messages[1])).toBe('✔ Kanban t_1 done — shipped')
++  })
++
+   it('never paints a background-process heartbeat wake as a user bubble', () => {
+     // Current backends type the wake `display_kind: 'hidden'`; a row persisted by an older
+     // backend arrives untyped and must disappear the same way — the user never wrote it.
+diff --git a/apps/desktop/src/lib/chat-messages/hydration.ts b/apps/desktop/src/lib/chat-messages/hydration.ts
+index aae8a7c6bb..e91087e207 100644
+--- a/apps/desktop/src/lib/chat-messages/hydration.ts
++++ b/apps/desktop/src/lib/chat-messages/hydration.ts
+@@ -169,7 +169,9 @@ const NOTICE_DISPLAY_KINDS = [
+   // Hermes closing a failed turn, not the model speaking.
+   'failed_turn',
+   // [daveey] A client's Stop ended the turn ("Stopped by redde").
+-  'turn_stopped'
++  'turn_stopped',
++  // [daveey] A kanban result persisted into a chat no backend had loaded.
++  'kanban_notice'
+ ] as const
+ 
+ function isMachineNotice(displayKind: SessionMessage['display_kind']): boolean {
+@@ -288,6 +290,10 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
+     return timelineDisplayText(message.display_metadata) ?? 'turn stopped'
+   }
+ 
++  if (message.display_kind === 'kanban_notice') {
++    return timelineDisplayText(message.display_metadata) ?? content
++  }
++
+   if (message.display_kind === 'async_delegation_complete') {
+     const count = timelineTaskCount(message.display_metadata)
+ 
+diff --git a/apps/desktop/src/lib/session-signatures.test.ts b/apps/desktop/src/lib/session-signatures.test.ts
+index 230210a7f7..bd7c47a711 100644
+--- a/apps/desktop/src/lib/session-signatures.test.ts
++++ b/apps/desktop/src/lib/session-signatures.test.ts
+@@ -56,6 +56,7 @@ describe('sameCronSignature', () => {
+   it.each([
+     ['kanban_active', 2, 1],
+     ['kanban_blocked', 1, undefined],
++    ['kanban_unseen', 1, undefined],
+     ['goal_active', true, undefined],
+     ['cron_active', true, undefined],
+     ['background_active', 1, 2]
+diff --git a/apps/desktop/src/lib/session-signatures.ts b/apps/desktop/src/lib/session-signatures.ts
+index 1eca1daee9..034da3a2fc 100644
+--- a/apps/desktop/src/lib/session-signatures.ts
++++ b/apps/desktop/src/lib/session-signatures.ts
+@@ -46,6 +46,7 @@ export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
+       // sidebar badge and the done/working stripe. [daveey]
+       session.kanban_active === other.kanban_active &&
+       session.kanban_blocked === other.kanban_blocked &&
++      session.kanban_unseen === other.kanban_unseen &&
+       session.goal_active === other.goal_active &&
+       session.cron_active === other.cron_active &&
+       session.background_active === other.background_active &&
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index faf44fdbb6..a1996c2948 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -19,6 +19,7 @@ import {
+   $delegatingSessionIds,
+   $goalActiveSessionIds,
+   $kanbanBusySessionIds,
++  $kanbanUnseenSessionIds,
+   $sessionDotStateById,
+   $unreadSessionCount,
+   hasLiveTurn,
+@@ -499,3 +500,49 @@ describe('withRowActivity', () => {
+     expect(withRowActivity('idle', { goal_active: false, kanban_active: 0 })).toBe('idle')
+   })
+ })
++
++// [daveey] A chat that was not loaded anywhere when its cards finished.
++describe('kanban results waiting for an unloaded session ($kanbanUnseenSessionIds)', () => {
++  beforeEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++    $unreadWriteGuard.set(new Map())
++  })
++
++  afterEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++  })
++
++  it('all cards done plus an unseen result paints green (unread -> done stripe)', () => {
++    setSessions([storedRow('s1', { kanban_active: 0, kanban_unseen: 2 }), storedRow('s2')])
++
++    expect($kanbanUnseenSessionIds.get()).toEqual(['s1'])
++    expect($sessionDotStateById.get()['s1']).toBe('unread')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('cards still running keep the row in background (no stripe), even with a result waiting', () => {
++    setSessions([storedRow('s1', { kanban_active: 1, kanban_unseen: 1 })])
++
++    expect($sessionDotStateById.get()['s1']).toBe('background')
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++  })
++
++  it('an orphan-reaped idle session with no cards is green, never working or stalled', () => {
++    setSessions([storedRow('s1', { ended_at: 1, end_reason: 'startup_orphan_reap' } as never)])
++
++    const state = $sessionDotStateById.get()['s1'] ?? 'idle'
++
++    expect(state === 'working' || state === 'stalled').toBe(false)
++    expect(sessionStatusStripe(state, true)).toBe('done')
++  })
++
++  it('withRowActivity turns an idle project-tree row with a waiting result green', () => {
++    expect(withRowActivity('idle', { kanban_active: 0, kanban_unseen: 1 })).toBe('unread')
++    expect(withRowActivity('idle', { kanban_active: 1, kanban_unseen: 1 })).toBe('background')
++    expect(withRowActivity('idle', { kanban_active: 0 })).toBe('idle')
++  })
++})
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 10ecc9d875..a26a36614b 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -88,6 +88,26 @@ export const $kanbanBusySessionIds = computed([$sessions, $messagingSessions], (
+   return (kanbanBusyIds = stableArray(kanbanBusyIds, ids))
+ })
+ 
++// [daveey] Sessions whose kanban cards finished while no backend held the chat:
++// the result is waiting in the kanban store (`kanban_unseen`, until the
++// unloaded-session sweeper hands it over; after that it is a persisted unread
++// row). It is "done, results waiting" — the same green as an unread finish —
++// and yields to running cards, which keep the row in `background`.
++let kanbanUnseenIds: readonly string[] = []
++export const $kanbanUnseenSessionIds = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++  const ids: string[] = []
++
++  for (const rows of [sessions, messaging]) {
++    for (const row of rows) {
++      if ((row.kanban_unseen ?? 0) > 0) {
++        ids.push(row.id)
++      }
++    }
++  }
++
++  return (kanbanUnseenIds = stableArray(kanbanUnseenIds, ids))
++})
++
+ // [daveey] Sessions owning a live background process, per the backend. The
+ // renderer's own $backgroundRunningSessionIds only knows sessions it polled
+ // after one of their tool events streamed into this window, so a turn the
+@@ -244,11 +264,14 @@ export const sessionStatusStripe = (
+  *  Same claim (and priority) as the store: it beats idle/unread/draft only. */
+ export const withRowActivity = (
+   state: SessionDotState,
+-  row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active'>
++  row: Pick<SessionInfo, 'background_active' | 'goal_active' | 'kanban_active'> &
++    Partial<Pick<SessionInfo, 'kanban_unseen'>>
+ ): SessionDotState =>
+   (state === 'idle' || state === 'unread' || state === 'draft') &&
+   (row.goal_active === true || (row.kanban_active ?? 0) > 0 || (row.background_active ?? 0) > 0)
+     ? 'background'
++    : (state === 'idle' || state === 'draft') && (row.kanban_unseen ?? 0) > 0
++    ? 'unread'
+     : state
+ 
+ /** Whether this turn is the session's own, live: brighter title, and the row's
+@@ -285,6 +308,7 @@ export const $sessionDotStateById = computed(
+     $backgroundActiveSessionIds,
+     $delegatingSessionIds,
+     $kanbanBusySessionIds,
++    $kanbanUnseenSessionIds,
+     $goalActiveSessionIds,
+     $unreadFinishedSessionIds,
+     $draftSessionIds,
+@@ -299,6 +323,7 @@ export const $sessionDotStateById = computed(
+     backgroundActive,
+     delegating,
+     kanbanBusy,
++    kanbanUnseen,
+     goalActive,
+     unread,
+     draft,
+@@ -349,6 +374,9 @@ export const $sessionDotStateById = computed(
+     }
+ 
+     claim(persistedUnread, 'unread')
++    // Finished kanban cards whose result no chat has been handed yet: green,
++    // below every live claim (running cards, a goal, a turn) painted next.
++    claim(kanbanUnseen, 'unread')
+ 
+     claim(background, 'background')
+     // Same claim from the backend's process registry (survives restarts).
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 0d5d09dff2..a3a1667633 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -643,6 +643,12 @@ export interface SessionInfo {
+    *  are blocked on a human, summed over its compression lineage. Shown next
+    *  to the open count on the sidebar row. Absent when zero. */
+   kanban_blocked?: number
++  /** [daveey] Finished kanban cards (created or subscribed) whose result this
++   *  conversation has not been handed — it was not loaded in any backend when
++   *  they completed. Paints the row green (unread) until the gateway's
++   *  unloaded-session sweeper writes the notice into the transcript. Absent
++   *  when zero. */
++  kanban_unseen?: number
+   /** [daveey] True while this conversation's standing `/goal` is still
+    *  active (running between turns or parked on a judge `wait` timer). The
+    *  goal loop resumes it unasked, so the sidebar paints it like a background
+@@ -763,6 +769,7 @@ export interface SessionMessage {
+     | 'auto_continue'
+     | 'failed_turn'
+     | 'hidden'
++    | 'kanban_notice'
+     | 'model_switch'
+     | 'personality_switch'
+     | 'process_complete'
+diff --git a/hermes_cli/kanban_session_activity.py b/hermes_cli/kanban_session_activity.py
+index cccf620a26..676d7b911f 100644
+--- a/hermes_cli/kanban_session_activity.py
++++ b/hermes_cli/kanban_session_activity.py
+@@ -41,7 +41,7 @@ HUMAN_BLOCK_KINDS = ("needs_input", "capability")
+ 
+ _CACHE_TTL_S = 3.0
+ _cache_lock = threading.Lock()
+-_cache: tuple[float, dict[str, int], dict[str, int]] | None = None
++_cache: tuple[float, dict[str, int], dict[str, int], dict[str, int]] | None = None
+ 
+ 
+ def _board_db_paths() -> list[Path]:
+@@ -111,16 +111,44 @@ def _read_counts(path: Path, statuses: tuple[str, ...] = ACTIVE_STATUSES) -> dic
+     return counts
+ 
+ 
+-def _all_counts() -> tuple[dict[str, int], dict[str, int]]:
+-    """``(active, blocked)`` per-session task counts across every board, cached."""
++# Terminal kinds that produce a visible notice (mirrors tui_gateway.session_notifications; silent kinds such as
++# archived/unblocked never leave a notice waiting).
++UNSEEN_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status")
++
++
++def _read_unseen(path: Path) -> dict[str, int]:
++    """``tui`` subscriptions per chat whose cursor trails a terminal event: a result the session has not been
++    handed yet (its backend is gone, so no poller claims it until the unloaded-session sweeper does). [daveey]"""
++    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.5)
++    try:
++        ph = ",".join("?" for _ in UNSEEN_KINDS)
++        rows = conn.execute(
++            f"SELECT s.chat_id, COUNT(*) FROM kanban_notify_subs s WHERE s.platform = 'tui' AND s.chat_id != '' "
++            f"AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id = s.task_id AND e.id > s.last_event_id "
++            f"AND e.kind IN ({ph})) GROUP BY s.chat_id", UNSEEN_KINDS).fetchall()
++    except sqlite3.Error:  # board predates notify subscriptions
++        return {}
++    finally:
++        conn.close()
++    return {str(sid): int(n) for sid, n in rows}
++
++
++def _all_counts() -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
++    """``(active, blocked, unseen)`` per-session task counts across every board, cached."""
+     global _cache
+     now = time.monotonic()
+     with _cache_lock:
+         if _cache is not None and now < _cache[0]:
+-            return _cache[1], _cache[2]
++            return _cache[1], _cache[2], _cache[3]
+     active: dict[str, int] = {}
+     blocked: dict[str, int] = {}
++    unseen: dict[str, int] = {}
+     for path in _board_db_paths():
++        try:
++            for sid, n in _read_unseen(path).items():
++                unseen[sid] = unseen.get(sid, 0) + n
++        except sqlite3.Error as exc:
++            _log.debug("kanban unseen read failed for %s: %s", path, exc)
+         for statuses, into in ((ACTIVE_STATUSES, active), (BLOCKED_STATUSES, blocked)):
+             try:
+                 for sid, n in _read_counts(path, statuses).items():
+@@ -128,8 +156,8 @@ def _all_counts() -> tuple[dict[str, int], dict[str, int]]:
+             except sqlite3.Error as exc:  # an old schema without session_id, a locked file
+                 _log.debug("kanban activity read failed for %s: %s", path, exc)
+     with _cache_lock:
+-        _cache = (now + _CACHE_TTL_S, active, blocked)
+-    return active, blocked
++        _cache = (now + _CACHE_TTL_S, active, blocked, unseen)
++    return active, blocked, unseen
+ 
+ 
+ def active_task_counts() -> dict[str, int]:
+@@ -211,19 +239,20 @@ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+ 
+ 
+ def annotate_kanban_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+-    """Stamp ``kanban_active`` and ``kanban_blocked`` on each session row
++    """Stamp ``kanban_active``, ``kanban_blocked`` and ``kanban_unseen`` (finished cards whose result the
++    session has not been handed yet) on each session row
+     (summed over its whole compression lineage). Never raises: the list must
+     render without them."""
+     if not rows:
+         return rows
+     try:
+-        active, blocked = _all_counts()
++        active, blocked, unseen = _all_counts()
+     except Exception:
+         _log.debug("kanban activity unavailable", exc_info=True)
+         return rows
+     for row in rows:
+         ids = list(_row_ids(row))
+-        for key, counts in (("kanban_active", active), ("kanban_blocked", blocked)):
++        for key, counts in (("kanban_active", active), ("kanban_blocked", blocked), ("kanban_unseen", unseen)):
+             n = sum(counts.get(sid, 0) for sid in ids)
+             if n:
+                 row[key] = n
+diff --git a/tests/hermes_cli/test_kanban_session_activity.py b/tests/hermes_cli/test_kanban_session_activity.py
+index 3797ad401a..1b326a5413 100644
+--- a/tests/hermes_cli/test_kanban_session_activity.py
++++ b/tests/hermes_cli/test_kanban_session_activity.py
+@@ -184,3 +184,26 @@ def test_session_kanban_tasks_endpoint(kanban_root, _isolate_hermes_home):
+     assert res.status_code == 200
+     assert [t["id"] for t in res.json()["tasks"]] == ["t_run"]
+     assert client.get("/api/session-kanban-tasks").status_code == 422
++
++
++def test_kanban_unseen_counts_subscriptions_trailing_a_terminal_event(kanban_root):
++    """[daveey] A finished card whose result no backend claimed shows up as ``kanban_unseen``; a claimed one,
++    a silent kind and a running card do not."""
++    path = kanban_root / "kanban.db"
++    path.parent.mkdir(parents=True, exist_ok=True)
++    conn = sqlite3.connect(path)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT NOT NULL, session_id TEXT)")
++    conn.execute("CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT)")
++    conn.execute("CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT, chat_id TEXT, "
++                 "thread_id TEXT DEFAULT '', last_event_id INTEGER DEFAULT 0)")
++    conn.executemany("INSERT INTO tasks VALUES (?, 'done', NULL)", [("a",), ("b",), ("c",), ("d",)])
++    conn.executemany("INSERT INTO task_events (id, task_id, kind) VALUES (?, ?, ?)",
++                     [(1, "a", "completed"), (2, "b", "completed"), (3, "c", "archived"), (4, "d", "created")])
++    conn.executemany("INSERT INTO kanban_notify_subs VALUES (?, 'tui', ?, '', ?)",
++                     [("a", "s_gone", 0), ("b", "s_claimed", 2), ("c", "s_silent", 0), ("d", "s_run", 0)])
++    conn.commit()
++    conn.close()
++    rows = [{"id": "s_gone"}, {"id": "s_claimed"}, {"id": "s_silent"}, {"id": "s_run"}]
++    ksa.annotate_kanban_activity(rows)
++    assert rows[0]["kanban_unseen"] == 1
++    assert all("kanban_unseen" not in r for r in rows[1:])
+diff --git a/tests/tui_gateway/test_projects_rpc.py b/tests/tui_gateway/test_projects_rpc.py
+index 537dc57dc2..41efdbe63d 100644
+--- a/tests/tui_gateway/test_projects_rpc.py
++++ b/tests/tui_gateway/test_projects_rpc.py
+@@ -776,7 +776,7 @@ def test_tree_rows_carry_session_activity_stamps(monkeypatch, tmp_path):
+         _create_session(launch_home, sid, repo)
+ 
+     monkeypatch.setattr(goal_session_activity, "active_goal_sessions", lambda: frozenset({"s_goal"}))
+-    monkeypatch.setattr(kanban_session_activity, "_all_counts", lambda: ({"s_cards": 2}, {"s_cards": 1}))
++    monkeypatch.setattr(kanban_session_activity, "_all_counts", lambda: ({"s_cards": 2}, {"s_cards": 1}, {}))
+     monkeypatch.setattr(cron_session_activity, "cron_owner_sessions", lambda: frozenset())
+     monkeypatch.setattr(process_session_activity, "_owned_processes", lambda: {"s_quiet": set()})
+ 
+-- 
+2.55.0
+

@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
+import select
 import socket
 import struct
 import time
@@ -110,6 +111,8 @@ class RFBClient:
     """Blocking client. Use as a context manager: `with RFBClient(host, user=..., password=...) as c:`."""
 
     PREFERRED = (30, 33, 2)
+
+    UPDATE_GRACE_S = 2.0  # quiet time after an update before a partial framebuffer counts as complete
 
     def __init__(self, host: str, port: int = 5900, user: str = "", password: str = "", timeout: float = 15.0):
         self.host, self.port, self.user, self.password, self.timeout = host, port, user, password, timeout
@@ -238,9 +241,15 @@ class RFBClient:
         covered = 0
         need = self.width * self.height
         deadline = time.time() + max(self.timeout, 30)
+        updates = 0
         while covered < need:
             if time.time() > deadline:
                 raise TimeoutError("timed out waiting for the full framebuffer")
+            # A multi-display Mac reports the bounding box of all displays as the framebuffer but
+            # only ever sends rects for the displays themselves, so the dead corners never arrive.
+            # Once an update has landed, a quiet socket at a message boundary means "that's all".
+            if updates and not select.select([self.sock], [], [], self.UPDATE_GRACE_S)[0]:
+                break
             mtype = self._u("B")
             if mtype == 0:
                 self._recv(1)
@@ -262,6 +271,7 @@ class RFBClient:
                         o = ((y + r) * self.width + x) * 4
                         frame.bgrx[o:o + row] = data[r * row:(r + 1) * row]
                     covered += w * h
+                updates += 1
             elif mtype == 1:  # colour map (unused with true colour)
                 self._recv(3)
                 self._recv(self._u("H") * 6)

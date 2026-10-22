@@ -346,9 +346,36 @@ def bug_signature(tool: str, result: Any, status: Optional[str], error_type: Opt
     if status == "error" and error_type and (EXC_NAME_RE.match(error_type) or error_type == "thread_missing_result"):
         return _normalize_sig(f"{tool}: {error_type}: {text}")
     if status == "error" and tool in HERMES_INFRA_TOOLS:
-        d = _as_dict(result) or {}
+        d = _as_dict(result) or _leading_dict(result)
+        if _guided_refusal(tool, d):
+            return None
         return _normalize_sig(f"{tool}: {text or d.get('error') or 'failed'}")
     return None
+
+
+def _leading_dict(result: Any) -> dict:
+    """The JSON object a result starts with, when Hermes appended guidance text after it (repeat-failure hints)."""
+    if isinstance(result, str) and result.lstrip().startswith("{"):
+        try:
+            d, _ = json.JSONDecoder().raw_decode(result.lstrip())
+            return d if isinstance(d, dict) else {}
+        except ValueError:
+            pass
+    return {}
+
+
+def _guided_refusal(tool: str, d: dict) -> bool:
+    """A designed validation refusal that tells the agent how to retry (the agent's mistake, not a Hermes bug).
+
+    The memory tool refuses over-budget adds/patches/batches, zero-match or ambiguous old_text, empty content and
+    scan hits on purpose, with the fix in the message, and the agent's next call recovers. Filing those as
+    "Hermes bug" cards spent a fix-worker card on working-as-designed guards. Hermes-side memory failures still count:
+    an unreadable file (read_failed), external drift (drift_backup) and the terminal per-turn retry cap
+    (done=True: the guidance failed to get the agent through).
+    """
+    if tool != "memory" or d.get("success") is not False or d.get("done") or "drift_backup" in d:
+        return False
+    return "could not be read right now" not in str(d.get("error") or "")
 
 
 def _normalize_sig(s: str) -> str:

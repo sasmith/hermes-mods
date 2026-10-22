@@ -74,13 +74,26 @@ def _parse_json(raw: str) -> dict:
         return {}
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def session_context(session_id: str, text: str, db_path: Optional[Path] = None) -> dict:
     """Title/cwd plus user/assistant messages strictly before the just-sent `text`."""
     if not session_id:
         return {"title": "", "cwd": "", "prior_user": [], "last_assistant": ""}
     p = db_path or hermes_home() / "state.db"
     try:
-        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+        con = _ro_connect(p, timeout=5)
         con.row_factory = sqlite3.Row
     except Exception:
         return {"title": "", "cwd": "", "prior_user": [], "last_assistant": ""}

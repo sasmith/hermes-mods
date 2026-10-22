@@ -1,0 +1,29 @@
+2026-10-22 08:00:01,100 WARNING gateway.run: No messaging platforms enabled.
+2026-10-22 08:00:02,200 ERROR agent.chat_completion_helpers: Streaming failed before delivery: Error code: 429 - rate limited
+Traceback (most recent call last):
+  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 3756, in _call
+    self.result["response"] = run()
+  File "/home/you/.hermes/hermes-agent/agent/chat_completion_helpers.py", line 3737, in _call_wire
+    return self._call_anthropic(request_client)
+anthropic.RateLimitError: Error code: 429 - {'type': 'error', 'error': {'type': 'rate_limit_error'}}
+2026-10-22 08:01:00,000 WARNING [20261022_080000_aaaaaa] agent.tool_executor: Tool terminal returned error (0.2s): {"output": "Traceback (most recent call last):\n  File \"x.py\"", "exit_code": 1}
+2026-10-22 08:02:00,000 ERROR gateway.run: Could not replay async completions for profile 'example'
+Traceback (most recent call last):
+  File "/home/you/.hermes/hermes-agent/gateway/run.py", line 1200, in _replay_async
+    reconcile_state_schema(db)
+  File "/home/you/.hermes/hermes-agent/hermes_state_schema.py", line 88, in reconcile_state_schema
+    conn.execute("pragma user_version")
+sqlite3.DatabaseError: database disk image is malformed
+2026-10-22 08:03:00,000 ERROR gateway.run: Could not replay async completions for profile 'example'
+Traceback (most recent call last):
+  File "/home/you/.hermes/hermes-agent/gateway/run.py", line 1210, in _replay_async
+    reconcile_state_schema(db)
+  File "/home/you/.hermes/hermes-agent/hermes_state_schema.py", line 90, in reconcile_state_schema
+    conn.execute("pragma user_version")
+sqlite3.DatabaseError: database disk image is malformed
+2026-10-22 08:04:00,000 WARNING [20261022_080400_bbbbbb] hermes_cli.plugins_dispatch: Hook 'pre_llm_call' callback on_pre raised: KeyError: 'user_message' (hook provides: session_id, user_message_text; identical failures are logged at DEBUG from now on)
+2026-10-22 08:05:00,000 ERROR tools.mcp_tool: MCP server crashed
+Traceback (most recent call last):
+  File "/home/you/.hermes/plugins/example-plugin/__init__.py", line 42, in on_event
+    payload["x"]
+KeyError: 'x'

@@ -68,6 +68,10 @@ LANE_WHERE = {
     "fixer": "((t.created_by = 'coach' and coalesce(t.idempotency_key, '') not like 'coach-trial:%') "
              "or t.idempotency_key like 'coach-fix:%' or t.idempotency_key like 'coach-bug:%')",
     "trial": "t.idempotency_key like 'coach-trial:%'",
+    # self-heal investigation + fix cards (plugins/coach/self_heal.py): `selfheal:<component>-<10 hex>[...]`; the
+    # numbered build cards (`selfheal:1-detector`) carry no hash and are not paid by the lane
+    "selfheal": "(t.idempotency_key glob 'selfheal:*-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*' "
+                "or t.idempotency_key like 'selfheal-fix:%')",
 }
 
 

@@ -39,6 +39,19 @@ export function findTaskIds(text) {
   return out
 }
 
+/** Which session the "open session" button should land on. The run's own worker session
+ *  (current run first, else the newest run that has one); falls back to the CREATING chat
+ *  (`task.session_id`) with a matching label; null when there is nothing useful to open
+ *  (no id, or it is the chat already in focus). */
+export function sessionTarget(d, focused) {
+  const runs = Array.isArray(d?.runs) ? d.runs : []
+  const cur = d?.task?.current_run_id
+  const run = runs.find(r => r.id === cur && r.worker_session_id) || [...runs].reverse().find(r => r.worker_session_id)
+  const worker = run?.worker_session_id
+  const target = worker ? { id: worker, label: 'Open worker session' } : d?.task?.session_id ? { id: d.task.session_id, label: 'Open creating chat' } : null
+  return target && target.id !== focused ? target : null
+}
+
 export function ago(seconds, now = Date.now()) {
   if (!seconds) return ''
   const s = Math.max(0, Math.round(now / 1000 - Number(seconds)))
@@ -60,7 +73,7 @@ const STATUS_COLORS = {
   ready: '#a371f7',
   todo: '#8b949e',
   triage: '#d29922',
-  scheduled: '#8b949e',
+  scheduled: '#e3b341', // waiting on a timer
   blocked: '#f85149',
   review: '#db61a2',
   done: '#3fb950',
@@ -595,6 +608,7 @@ function createUI(host) {
         setTimeout(() => (btn.textContent = old), 1000)
       })
     }
+    const sess = sessionTarget(d, host.state?.focusedSessionId?.get?.())
     const foot = h(
       'div',
       { class: 'tm-foot' },
@@ -603,8 +617,8 @@ function createUI(host) {
         ? h('button', { class: 'tm-btn tm-primary', title: 'Open this card on the board to edit it or comment', onclick: () => (closeModal(), void openCard(t.id, entry)) }, 'Open card')
         : null,
       // Worker session + board live on the task's gateway; both buttons open the ACTIVE one.
-      !remote && t.session_id && typeof host.openSession === 'function'
-        ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), void host.openSession(t.session_id).catch(e => host.notifyError?.(e, 'Could not open worker session'))) }, 'Open worker session')
+      !remote && sess && typeof host.openSession === 'function'
+        ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), void host.openSession(sess.id).catch(e => host.notifyError?.(e, `Could not ${sess.label.toLowerCase()}`))) }, sess.label)
         : null,
       !remote && typeof host.navigate === 'function' ? h('button', { class: 'tm-btn', onclick: () => (closeModal(), host.navigate('/kanban')) }, 'Open board') : null,
       h('button', { class: 'tm-btn', onclick: e => copy(t.id, e.currentTarget) }, 'Copy id'),

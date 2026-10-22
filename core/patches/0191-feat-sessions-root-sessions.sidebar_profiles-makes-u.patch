@@ -1,0 +1,185 @@
+From 00e6987ee0e7194d3415f39bc64605d8d77eecf6 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:27:40 -0700
+Subject: [PATCH] feat(sessions): root sessions.sidebar_profiles makes unlisted
+ profiles automated by default [daveey]
+
+Bot profiles each needed sessions.automated_sources: ["*"] by hand; one nobody configured
+(mac-ops) leaked into the sidebar. When the ROOT home's sessions.sidebar_profiles is non-empty,
+a profile not on it is stamped automated on every sidebar payload unless its own config.yaml
+sets automated_sources or interactive_sources explicitly (even []). Read from the root home,
+never the profile's. Unset/[] keeps the old behaviour.
+---
+ hermes_cli/config_defaults.py                 |  5 ++
+ hermes_cli/session_listing.py                 | 42 ++++++++++++++-
+ .../hermes_cli/test_profiles_sidebar_scope.py | 12 +++++
+ tests/hermes_cli/test_session_listing.py      | 54 +++++++++++++++++++
+ 4 files changed, 112 insertions(+), 1 deletion(-)
+
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 6ab16f8610..ac40ce3321 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -2347,6 +2347,11 @@ DEFAULT_CONFIG = {
+         # source writing into a human profile stays out of the sidebar by default. Rows with no
+         # source are never flagged by this list. [] = off (only automated_sources applies). [daveey]
+         "interactive_sources": [],
++        # ROOT home only (ignored in a profile's own config): the profiles whose sessions belong in
++        # the desktop sidebar. When non-empty, every profile NOT listed is treated as
++        # automated_sources: ["*"] unless its own config sets automated_sources or
++        # interactive_sources explicitly, so a new bot profile starts hidden. [] = off. [daveey]
++        "sidebar_profiles": [],
+         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
+         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
+         # deleted AND freelist/page_count > 25%.
+diff --git a/hermes_cli/session_listing.py b/hermes_cli/session_listing.py
+index b78f52c649..cbc771bea2 100644
+--- a/hermes_cli/session_listing.py
++++ b/hermes_cli/session_listing.py
+@@ -92,6 +92,34 @@ class AutomatedSourcePolicy(list):
+         return bool(len(self) or self.interactive)
+ 
+ 
++def _profile_sets_source_policy(hermes_home: str | Path) -> bool:
++    """Whether *hermes_home*'s own config.yaml spells out ``sessions.automated_sources`` or
++    ``sessions.interactive_sources`` (even as ``[]``), as written, not merged with defaults."""
++    from hermes_cli.config import read_raw_config_readonly
++    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
++
++    token = set_hermes_home_override(str(hermes_home))
++    try:
++        sessions_cfg = read_raw_config_readonly().get("sessions") or {}
++    except Exception:
++        return False
++    finally:
++        reset_hermes_home_override(token)
++    return isinstance(sessions_cfg, dict) and (
++        "automated_sources" in sessions_cfg or "interactive_sources" in sessions_cfg)
++
++
++def _store_profile_and_root(hermes_home: str | Path) -> tuple[str, Path]:
++    """``(profile name, root home)`` for a store's home: ``<root>/profiles/<name>`` is named
++    profile ``<name>``, anything else is the ``default`` profile living in the root itself."""
++    from hermes_constants import named_profile_home
++
++    named = named_profile_home(hermes_home)
++    if named is not None:
++        return named.name, named.parent.parent
++    return "default", Path(hermes_home)
++
++
+ def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
+     """``sessions.automated_sources`` + ``sessions.interactive_sources`` from *hermes_home*'s own
+     config.yaml [daveey]: which session sources this profile marks ``automated`` (bot / smoke-test
+@@ -99,10 +127,22 @@ def automated_session_sources(hermes_home: str | Path) -> AutomatedSourcePolicy:
+     ``automated_sources``: exact sources, ``"*"`` marks every session in the store.
+     ``interactive_sources``: when non-empty, every source NOT listed is automated too.
+     Like ``sidebar_exclude_sources`` the store's home decides, never the process ``HERMES_HOME``.
++    ``sessions.sidebar_profiles`` in the ROOT home's config (never a profile's): when non-empty, a
++    profile NOT listed behaves as ``automated_sources: ["*"]`` unless its own config.yaml sets
++    ``automated_sources`` or ``interactive_sources`` explicitly, so a new bot profile starts hidden.
+     Empty policy when unset or unreadable."""
+-    return AutomatedSourcePolicy(
++    policy = AutomatedSourcePolicy(
+         _sessions_source_list(hermes_home, "automated_sources"),
+         _sessions_source_list(hermes_home, "interactive_sources"))
++    try:
++        profile, root = _store_profile_and_root(hermes_home)
++    except Exception:
++        return policy
++    sidebar_profiles = _sessions_source_list(root, "sidebar_profiles")
++    if (sidebar_profiles and profile.lower() not in sidebar_profiles
++            and not _profile_sets_source_policy(hermes_home)):
++        return AutomatedSourcePolicy([AUTOMATED_ALL_SOURCES])
++    return policy
+ 
+ 
+ def is_automated_source(source: Any, automated_sources: list[str] | None) -> bool:
+diff --git a/tests/hermes_cli/test_profiles_sidebar_scope.py b/tests/hermes_cli/test_profiles_sidebar_scope.py
+index 0b6cda6e66..b0f9cb89df 100644
+--- a/tests/hermes_cli/test_profiles_sidebar_scope.py
++++ b/tests/hermes_cli/test_profiles_sidebar_scope.py
+@@ -202,6 +202,18 @@ class TestAutomatedSessions:
+         assert flags["default-eval"] is False
+ 
+ 
++    def test_root_sidebar_profiles_hides_unlisted_profile(self, client, profiles_on_disk):
++        # [daveey] root sidebar_profiles: [default] -> the worker profile (no own policy) is
++        # automated on every payload; the default profile stays visible.
++        (profiles_on_disk["default"] / "config.yaml").write_text(
++            "sessions:\n  sidebar_profiles: [default]\n", encoding="utf-8")
++        _seed_session(profiles_on_disk["worker"], "worker-cli", source="cli")
++        _seed_session(profiles_on_disk["default"], "default-cli", source="cli")
++        rows = client.get("/api/profiles/sessions", params={"limit": 50}).json()["sessions"]
++        assert {r["id"]: r["automated"] for r in rows} == {"worker-cli": True, "default-cli": False}
++        one = client.get("/api/sessions", params={"profile": "worker", "limit": 5}).json()
++        assert {r["id"]: r["automated"] for r in one["sessions"]} == {"worker-cli": True}
++
+ class TestCrossProfileProjectTree:
+ 
+     def test_profile_sidebar_exclude_sources_hides_its_machine_sessions(self, client, profiles_on_disk):
+diff --git a/tests/hermes_cli/test_session_listing.py b/tests/hermes_cli/test_session_listing.py
+index c5b4e5bbe3..e20833e497 100644
+--- a/tests/hermes_cli/test_session_listing.py
++++ b/tests/hermes_cli/test_session_listing.py
+@@ -230,3 +230,57 @@ class TestInteractiveSources:
+         assert pol and list(pol) == [] and pol.interactive == ["desktop"]
+         assert is_automated_source("kanban", pol) and not is_automated_source("desktop", pol)
+         assert not is_automated_source("kanban", ["slack"])  # plain list callers: unchanged
++
++
++class TestSidebarProfiles:
++    """[daveey] Root-home ``sessions.sidebar_profiles``: unlisted profiles default to automated."""
++
++    def _tree(self, tmp_path, root_cfg, profiles):
++        root = tmp_path / ".hermes"
++        (root / "profiles").mkdir(parents=True)
++        (root / "config.yaml").write_text(root_cfg, encoding="utf-8")
++        homes = {"default": root}
++        for name, cfg in profiles.items():
++            home = root / "profiles" / name
++            home.mkdir()
++            (home / "config.yaml").write_text(cfg, encoding="utf-8")
++            homes[name] = home
++        return homes
++
++    def _stamp(self, home):
++        from hermes_cli.session_listing import stamp_automated
++        rows = [{"id": "c", "source": "cli"}, {"id": "d", "source": "desktop"}]
++        return {r["id"]: r["automated"] for r in stamp_automated(rows, home)}
++
++    def test_unlisted_profile_is_automated(self, tmp_path):
++        homes = self._tree(tmp_path, "sessions:\n  sidebar_profiles: [default]\n", {"newbot": "{}\n"})
++        assert self._stamp(homes["newbot"]) == {"c": True, "d": True}
++
++    def test_listed_profile_is_not(self, tmp_path):
++        homes = self._tree(tmp_path, "sessions:\n  sidebar_profiles: [default, Work]\n", {"work": "{}\n"})
++        assert self._stamp(homes["default"]) == {"c": False, "d": False}
++        assert self._stamp(homes["work"]) == {"c": False, "d": False}
++
++    def test_explicit_profile_setting_wins(self, tmp_path):
++        homes = self._tree(tmp_path, "sessions:\n  sidebar_profiles: [default]\n", {
++            "allow": "sessions:\n  interactive_sources: [desktop]\n",
++            "deny": "sessions:\n  automated_sources: [cli]\n",
++            "optout": "sessions:\n  automated_sources: []\n"})
++        assert self._stamp(homes["allow"]) == {"c": True, "d": False}
++        assert self._stamp(homes["deny"]) == {"c": True, "d": False}
++        assert self._stamp(homes["optout"]) == {"c": False, "d": False}
++
++    def test_unset_keeps_old_behaviour(self, tmp_path):
++        homes = self._tree(tmp_path, "{}\n", {"newbot": "{}\n"})
++        assert self._stamp(homes["newbot"]) == {"c": False, "d": False}
++        homes2 = self._tree(tmp_path / "x", "sessions:\n  sidebar_profiles: []\n", {"newbot": "{}\n"})
++        assert self._stamp(homes2["newbot"]) == {"c": False, "d": False}
++
++    def test_read_from_root_never_the_profile(self, tmp_path):
++        # A profile listing itself in its OWN config does not opt it in; the root decides.
++        homes = self._tree(tmp_path, "sessions:\n  sidebar_profiles: [default]\n",
++                           {"sneaky": "sessions:\n  sidebar_profiles: [sneaky]\n"})
++        assert self._stamp(homes["sneaky"]) == {"c": True, "d": True}
++        # ...and a profile-level list is ignored when the root sets none.
++        homes2 = self._tree(tmp_path / "y", "{}\n", {"bot": "sessions:\n  sidebar_profiles: [default]\n"})
++        assert self._stamp(homes2["bot"]) == {"c": False, "d": False}
+-- 
+2.55.0
+

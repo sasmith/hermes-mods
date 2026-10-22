@@ -136,6 +136,12 @@ unrelated plugins). Measure real latency from `eng_replies` (bot profile `slack-
    `quiet_channels`. Those feeds are most of the volume, so this is what keeps context useful.
 5. Add a short "Slack awareness" section to the bot's SOUL.md pointing at this skill: SOUL is always
    loaded, while this skill only loads on demand.
+6. Keep bot traffic out of the Desktop sidebar: set `sessions.automated_sources: ["*"]` on the bot profile
+   AND the follower profile (`hermes -p <p> config set sessions.automated_sources '["*"]' --force`; fork core
+   0166). Follower sessions started by `slack_engage`, smoke-test engagements included, are `source=cli` rows in
+   the follower profile, so `"*"` is what catches them. They are then hidden unless the sidebar filter
+   "Show automated & test sessions" is on. Pinned rows and rows waiting on you (red/grey stripe, needs input)
+   stay visible. Don't hide smoke-test sessions by hand.
 
 ## Pitfalls
 

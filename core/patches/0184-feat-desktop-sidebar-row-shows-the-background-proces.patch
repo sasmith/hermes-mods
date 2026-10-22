@@ -1,0 +1,1014 @@
+From 0cd16ad76273f920b36c06005369fd1324f3ba12 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 00:36:30 -0700
+Subject: [PATCH] feat(desktop): sidebar row shows the background processes
+ holding it off green, with Stop [daveey]
+
+A finished chat held un-green for ~24 h by a 72 h tap watcher showed nothing
+on its row to say why. The backend now stamps background_processes (id,
+redacted/truncated command, started_at, pid; oldest first) next to
+background_active, and the row renders a process glyph beside the kanban
+badge (count when >1). Hover lists each command with its age and a Stop
+button; click opens the session.
+
+Stop posts /api/sessions/{id}/background-processes/{proc}/stop, which kills
+via process_registry.kill_process (the process_manage kill path) when this
+backend supervises it, else terminates the start-time-checked pid of a
+process another Hermes process owns. Ownership is checked against the row's
+lineage ids; the stamp cache is dropped so the row goes green at once.
+---
+ apps/desktop/src/api/sessions.ts              |  22 +++
+ .../chat/sidebar/background-process-badge.tsx | 149 ++++++++++++++++++
+ .../src/app/chat/sidebar/session-row.test.tsx |  71 ++++++++-
+ .../src/app/chat/sidebar/session-row.tsx      |  20 ++-
+ apps/desktop/src/i18n/en.ts                   |   6 +-
+ apps/desktop/src/i18n/overlay-gaps.json       |   4 +
+ apps/desktop/src/i18n/types.ts                |   4 +
+ apps/desktop/src/lib/session-signatures.ts    |   6 +
+ .../src/store/session-background-stop.ts      |  42 +++++
+ .../src/store/session-dot-state.test.ts       |  56 +++++++
+ apps/desktop/src/store/session-dot-state.ts   |  59 ++++++-
+ apps/desktop/src/types/hermes.ts              |  14 ++
+ hermes_cli/process_session_activity.py        | 109 ++++++++++++-
+ hermes_cli/web_models.py                      |   9 +-
+ hermes_cli/web_routers/sessions.py            |  17 +-
+ .../test_process_session_activity.py          |  68 ++++++++
+ 16 files changed, 641 insertions(+), 15 deletions(-)
+ create mode 100644 apps/desktop/src/app/chat/sidebar/background-process-badge.tsx
+ create mode 100644 apps/desktop/src/store/session-background-stop.ts
+
+diff --git a/apps/desktop/src/api/sessions.ts b/apps/desktop/src/api/sessions.ts
+index 39995928d9..bba769499e 100644
+--- a/apps/desktop/src/api/sessions.ts
++++ b/apps/desktop/src/api/sessions.ts
+@@ -757,3 +757,25 @@ export function renameSession(
+     body: { title, ...(owner ? { profile: owner } : {}) }
+   })
+ }
++
++/** [daveey] Stop one live background process a sidebar row owns (the process
++ *  badge's Stop). Routes to the row's own gateway; the backend kills it via
++ *  the process registry (the `process_manage kill` path) or, for a process
++ *  another Hermes process supervises, by its start-time-checked pid. */
++export function stopSessionBackgroundProcess(
++  row: Pick<SessionInfo, '_lineage_ids' | '_lineage_root_id' | 'connection_id' | 'id' | 'profile'>,
++  processId: string
++): Promise<{ ok: boolean; status?: string }> {
++  const scope: ProfileScope = row.connection_id
++    ? { connectionId: row.connection_id, profile: row.profile || 'default' }
++    : row.profile
++
++  return hermesApi<{ ok: boolean; status?: string }>({
++    ...sessionScoped(scope),
++    path: `/api/sessions/${encodeURIComponent(row.id)}/background-processes/${encodeURIComponent(processId)}/stop`,
++    method: 'POST',
++    body: {
++      session_ids: [row._lineage_root_id, ...(row._lineage_ids ?? [])].filter((id): id is string => Boolean(id))
++    }
++  })
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/background-process-badge.tsx b/apps/desktop/src/app/chat/sidebar/background-process-badge.tsx
+new file mode 100644
+index 0000000000..780fb9a996
+--- /dev/null
++++ b/apps/desktop/src/app/chat/sidebar/background-process-badge.tsx
+@@ -0,0 +1,149 @@
++import { useEffect, useRef, useState } from 'react'
++
++import { Button } from '@/components/ui/button'
++import { Codicon } from '@/components/ui/codicon'
++import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
++import type { SessionInfo } from '@/hermes'
++import { useI18n } from '@/i18n'
++import { coarseElapsed } from '@/lib/time'
++import { stopRowBackgroundProcess } from '@/store/session-background-stop'
++import { rowBackgroundProcesses } from '@/store/session-dot-state'
++import type { SessionBackgroundProcess } from '@/types/hermes'
++
++// Hover → open; leaving the badge for the card (to reach Stop) must not close
++// it, so closing waits a beat and either surface's pointerenter cancels it.
++const CLOSE_DELAY_MS = 180
++
++const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
++
++/**
++ * [daveey] The live background processes that keep this row off green: a
++ * small process glyph (count when more than one) next to the kanban badge,
++ * same size/tone as the periodic loop glyph. Hover lists each command and its
++ * age with a Stop button; a click opens the session like the row does.
++ */
++export function BackgroundProcessBadge({ onOpen, session }: { onOpen: () => void; session: SessionInfo }) {
++  const { t } = useI18n()
++  const r = t.sidebar.row
++  const procs = rowBackgroundProcesses(session)
++  const [open, setOpen] = useState(false)
++  const closeTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
++
++  const cancelClose = () => {
++    if (closeTimer.current !== null) {
++      clearTimeout(closeTimer.current)
++      closeTimer.current = null
++    }
++  }
++
++  const show = () => {
++    cancelClose()
++    setOpen(true)
++  }
++
++  const hideSoon = () => {
++    cancelClose()
++    closeTimer.current = setTimeout(() => setOpen(false), CLOSE_DELAY_MS)
++  }
++
++  useEffect(() => cancelClose, [])
++
++  if (procs.length === 0) {
++    return null
++  }
++
++  const label = r.backgroundProcesses(procs.length)
++
++  const age = (proc: SessionBackgroundProcess): string => {
++    if (!proc.started_at) {
++      return ''
++    }
++
++    const { unit, value } = coarseElapsed(Date.now() - proc.started_at * 1000)
++
++    return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
++  }
++
++  return (
++    <Popover onOpenChange={setOpen} open={open}>
++      <PopoverAnchor asChild>
++        <button
++          aria-label={label}
++          className="pointer-events-auto ml-1 inline-flex items-center gap-px align-[-1px] tabular-nums text-(--ui-text-tertiary) hover:text-foreground focus-visible:text-foreground focus-visible:outline-none"
++          data-process-count={procs.length}
++          data-testid="session-row-background-processes"
++          onBlur={hideSoon}
++          onClick={event => {
++            event.stopPropagation()
++            setOpen(false)
++            onOpen()
++          }}
++          onFocus={show}
++          onPointerEnter={show}
++          onPointerLeave={hideSoon}
++          type="button"
++        >
++          <Codicon name="server-process" size="0.625rem" />
++          {procs.length > 1 && procs.length}
++        </button>
++      </PopoverAnchor>
++      <PopoverContent
++        align="end"
++        className="w-80 p-1.5"
++        data-testid="session-row-background-processes-card"
++        onCloseAutoFocus={event => event.preventDefault()}
++        onOpenAutoFocus={event => event.preventDefault()}
++        onPointerEnter={show}
++        onPointerLeave={hideSoon}
++        side="top"
++      >
++        <div className="px-1 pb-1 text-[0.6875rem] font-medium text-(--ui-text-secondary)">{label}</div>
++        <ul className="flex flex-col gap-0.5">
++          {procs.map(proc => (
++            <ProcessLine age={age(proc)} key={proc.id} proc={proc} session={session} />
++          ))}
++        </ul>
++      </PopoverContent>
++    </Popover>
++  )
++}
++
++function ProcessLine({ age, proc, session }: { age: string; proc: SessionBackgroundProcess; session: SessionInfo }) {
++  const { t } = useI18n()
++  const r = t.sidebar.row
++  const [stopping, setStopping] = useState(false)
++  // Placeholder rows (an older backend stamped only the count) name nothing
++  // the backend could stop.
++  const stoppable = !proc.id.startsWith('#')
++
++  return (
++    <li className="flex items-center gap-2 rounded-md px-1 py-0.5 hover:bg-(--ui-control-hover-background)">
++      <span
++        className="min-w-0 flex-1 truncate font-mono text-[0.6875rem] text-foreground"
++        data-process-id={proc.id}
++        title={proc.command || undefined}
++      >
++        {proc.command || r.backgroundProcessUnnamed}
++      </span>
++      {age && <span className="shrink-0 text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">{age}</span>}
++      {stoppable && (
++        <Button
++          className="h-5 shrink-0 px-1.5 text-[0.625rem]"
++          disabled={stopping}
++          onClick={async event => {
++            event.stopPropagation()
++            setStopping(true)
++
++            if (!(await stopRowBackgroundProcess(session, proc.id))) {
++              setStopping(false)
++            }
++          }}
++          size="sm"
++          variant="outline"
++        >
++          {stopping ? r.stoppingProcess : r.stopProcess}
++        </Button>
++      )}
++    </li>
++  )
++}
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+index f2b8e0a89a..0537525651 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.test.tsx
+@@ -35,6 +35,10 @@ vi.mock('@/i18n', () => ({
+           ageMin: 'm',
+           ageNow: 'now',
+           kanbanTasks: (open: number, blocked: number) => `${open} open, ${blocked} blocked`,
++          backgroundProcesses: (count: number) => `${count} background processes`,
++          backgroundProcessUnnamed: 'background process',
++          stopProcess: 'Stop',
++          stoppingProcess: 'Stopping…',
+           backgroundRunning: 'Running in background',
+           finishedUnread: 'Finished',
+           handoffOrigin: (platform: string) => `Started on ${platform}`,
+@@ -162,7 +166,7 @@ function makeSession(overrides: Partial<SessionInfo> & { title: string }): Sessi
+ 
+ const noop = vi.fn()
+ 
+-const renderRow = (session: SessionInfo, extra?: { card?: boolean; selected?: boolean }) =>
++const renderRow = (session: SessionInfo, extra?: { card?: boolean; onResume?: () => void; selected?: boolean }) =>
+   render(
+     <SidebarSessionRow
+       card={extra?.card}
+@@ -171,7 +175,7 @@ const renderRow = (session: SessionInfo, extra?: { card?: boolean; selected?: bo
+       onArchive={noop}
+       onDelete={noop}
+       onPin={noop}
+-      onResume={noop}
++      onResume={extra?.onResume ?? noop}
+       onToggleUnread={noop}
+       session={session}
+       unread={false}
+@@ -537,3 +541,66 @@ describe('SidebarSessionRow own activity stamps', () => {
+     expect(stripe(container)).toBe('done')
+   })
+ })
++
++// [daveey] A finished chat held off green only by a background process says
++// so: a process glyph beside the kanban badge, hover lists it with Stop.
++describe('SidebarSessionRow background process badge', () => {
++  const proc = { command: 'sleep 600', id: 'proc_a' }
++
++  const held = (extra: Partial<SessionInfo> = {}) =>
++    makeSession({
++      background_active: 1,
++      background_processes: [{ ...proc, started_at: Date.now() / 1000 - 125 }],
++      id: 'held',
++      message_count: 4,
++      title: 'Held',
++      ...extra
++    } as Partial<SessionInfo> & { title: string })
++
++  it('shows the glyph (no count for one) and keeps the row off green', () => {
++    const { container } = renderRow(held())
++    const badge = screen.getByTestId('session-row-background-processes')
++
++    expect(badge.getAttribute('aria-label')).toBe('1 background processes')
++    expect(badge.textContent).toBe('')
++    expect(container.querySelector('[data-sidebar-stripe]')).toBeNull()
++  })
++
++  it('shows the count when more than one, in the one-line row and the card', () => {
++    const two = held({
++      background_active: 2,
++      background_processes: [proc, { command: 'gh run watch 1', id: 'proc_b' }]
++    } as Partial<SessionInfo>)
++
++    renderRow(two)
++    expect(screen.getByTestId('session-row-background-processes').textContent).toBe('2')
++    cleanup()
++    renderRow(two, { card: true })
++    expect(screen.getByTestId('session-row-background-processes').textContent).toBe('2')
++  })
++
++  it('hover lists the command, its age and a Stop button', async () => {
++    renderRow(held())
++    fireEvent.pointerEnter(screen.getByTestId('session-row-background-processes'))
++
++    const card = await screen.findByTestId('session-row-background-processes-card')
++    expect(card.textContent).toContain('sleep 600')
++    expect(card.textContent).toContain('5m') // coarseElapsed is mocked to 5 minutes above
++    expect(screen.getByRole('button', { name: 'Stop' })).toBeTruthy()
++  })
++
++  it('click opens the session', () => {
++    const onResume = vi.fn()
++    renderRow(held(), { onResume })
++    fireEvent.click(screen.getByTestId('session-row-background-processes'))
++
++    expect(onResume).toHaveBeenCalledTimes(1)
++  })
++
++  it('is gone once the process exits', () => {
++    const { container } = renderRow(makeSession({ id: 'held', message_count: 4, title: 'Held' }))
++
++    expect(screen.queryByTestId('session-row-background-processes')).toBeNull()
++    expect(container.querySelector('[data-sidebar-stripe]')?.getAttribute('data-sidebar-stripe')).toBe('done')
++  })
++})
+diff --git a/apps/desktop/src/app/chat/sidebar/session-row.tsx b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+index 594ead37e1..b58f9be9da 100644
+--- a/apps/desktop/src/app/chat/sidebar/session-row.tsx
++++ b/apps/desktop/src/app/chat/sidebar/session-row.tsx
+@@ -35,7 +35,13 @@ import { $projects } from '@/store/projects'
+ import { $pullRequestsByBranch, sessionPrKey } from '@/store/pull-requests'
+ import { sessionPinId } from '@/store/session'
+ import { $blockedSessionIds, isSessionBlocked } from '@/store/session-blocked'
+-import { $sessionDotStateById, hasLiveTurn, sessionStatusStripe, withRowActivity } from '@/store/session-dot-state'
++import {
++  $sessionDotStateById,
++  hasLiveTurn,
++  rowBackgroundProcesses,
++  sessionStatusStripe,
++  withRowActivity
++} from '@/store/session-dot-state'
+ import { $sessionListDensity } from '@/store/session-list-density'
+ import { $openStoredSessionIds } from '@/store/session-states'
+ import { sessionCostUsd } from '@/store/sidebar-archive'
+@@ -43,6 +49,7 @@ import { $todoProgressBySession } from '@/store/todos'
+ 
+ import { SessionStatusDot } from '../session-status-dot'
+ 
++import { BackgroundProcessBadge } from './background-process-badge'
+ import {
+   SIDEBAR_ROW_CARD_MIN_H,
+   SIDEBAR_TRUNCATED_LEADING,
+@@ -212,6 +219,13 @@ function SidebarSessionRowImpl({
+       </Tip>
+     ) : null
+ 
++  // [daveey] Live background processes holding this row off green: a process
++  // glyph beside the kanban badge; hover lists them with Stop, click opens.
++  const processBadge =
++    !session.archived && rowBackgroundProcesses(session).length > 0 ? (
++      <BackgroundProcessBadge onOpen={onResume} session={session} />
++    ) : null
++
+   // Pinned metadata occupies the actions slot and swaps out for the kebab on
+   // hover, so the row reserves the same width either way and never reflows.
+   const pinnedAge = rowMeta.includes('updated')
+@@ -289,17 +303,19 @@ function SidebarSessionRowImpl({
+               figures.at(-1)
+             )}
+             {kanbanCounts}
++            {processBadge}
+             {gatewayIcon}
+           </span>
+         </span>
+       )
+     })
+-  } else if (kanbanCounts || gatewayIcon) {
++  } else if (kanbanCounts || processBadge || gatewayIcon) {
+     trailing.push({
+       key: 'gateway',
+       node: (
+         <span className="pointer-events-none whitespace-nowrap text-[0.625rem] leading-none text-(--ui-text-tertiary)">
+           {kanbanCounts}
++          {processBadge}
+           {gatewayIcon}
+         </span>
+       )
+diff --git a/apps/desktop/src/i18n/en.ts b/apps/desktop/src/i18n/en.ts
+index c6f731878e..8f67ede569 100644
+--- a/apps/desktop/src/i18n/en.ts
++++ b/apps/desktop/src/i18n/en.ts
+@@ -3370,7 +3370,11 @@ export const en: Translations = {
+       kanbanTasks: (open, blocked) =>
+         [open > 0 ? `${open} kanban ${open === 1 ? 'task' : 'tasks'} open` : '', blocked > 0 ? `${blocked} blocked` : '']
+           .filter(Boolean)
+-          .join(', ')
++          .join(', '),
++      backgroundProcesses: count => `${count} background ${count === 1 ? 'process' : 'processes'} running`,
++      backgroundProcessUnnamed: 'background process',
++      stopProcess: 'Stop',
++      stoppingProcess: 'Stopping…'
+     },
+     dateDivider: {
+       today: 'Earlier today',
+diff --git a/apps/desktop/src/i18n/overlay-gaps.json b/apps/desktop/src/i18n/overlay-gaps.json
+index 1842c23914..90dcdc2a81 100644
+--- a/apps/desktop/src/i18n/overlay-gaps.json
++++ b/apps/desktop/src/i18n/overlay-gaps.json
+@@ -1948,6 +1948,10 @@
+   "sidebar.row.continuationOrigin": ["ja","ru","zh-hant"],
+   "sidebar.row.hideTabBar": ["ja","zh-hant"],
+   "sidebar.row.kanbanTasks": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.backgroundProcesses": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.backgroundProcessUnnamed": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.stopProcess": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
++  "sidebar.row.stoppingProcess": ["ar","de","es","fr","ja","ru","zh","zh-hant"],
+   "sidebar.row.messageCount": ["ar","ja","zh-hant"],
+   "sidebar.row.openInNewTab": ["ja","zh-hant"],
+   "sidebar.row.openInSplit": ["ja","zh-hant"],
+diff --git a/apps/desktop/src/i18n/types.ts b/apps/desktop/src/i18n/types.ts
+index 11a472da28..366d783f46 100644
+--- a/apps/desktop/src/i18n/types.ts
++++ b/apps/desktop/src/i18n/types.ts
+@@ -2941,6 +2941,10 @@ export interface Translations extends NoticeTranslations {
+       ageHour: string
+       ageMin: string
+       kanbanTasks: (open: number, blocked: number) => string
++      backgroundProcesses: (count: number) => string
++      backgroundProcessUnnamed: string
++      stopProcess: string
++      stoppingProcess: string
+     }
+     dateDivider: {
+       today: string
+diff --git a/apps/desktop/src/lib/session-signatures.ts b/apps/desktop/src/lib/session-signatures.ts
+index 5abacbd4d9..1eca1daee9 100644
+--- a/apps/desktop/src/lib/session-signatures.ts
++++ b/apps/desktop/src/lib/session-signatures.ts
+@@ -5,6 +5,11 @@
+ 
+ import type { SessionInfo, SessionMessage } from '@/hermes'
+ 
++// [daveey] Which background processes a row lists: one changing for another
++// keeps the count but must still repaint the badge's tooltip.
++const backgroundProcessKey = (session: SessionInfo): string =>
++  (session.background_processes ?? []).map(proc => proc.id).join(',')
++
+ export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
+   if (a.length !== b.length) {
+     return false
+@@ -44,6 +49,7 @@ export function sameCronSignature(a: SessionInfo[], b: SessionInfo[]): boolean {
+       session.goal_active === other.goal_active &&
+       session.cron_active === other.cron_active &&
+       session.background_active === other.background_active &&
++      backgroundProcessKey(session) === backgroundProcessKey(other) &&
+       session.review_wait === other.review_wait
+     )
+   })
+diff --git a/apps/desktop/src/store/session-background-stop.ts b/apps/desktop/src/store/session-background-stop.ts
+new file mode 100644
+index 0000000000..5f9359bce1
+--- /dev/null
++++ b/apps/desktop/src/store/session-background-stop.ts
+@@ -0,0 +1,42 @@
++/**
++ * [daveey] Stop a live background process from its sidebar row's process
++ * badge. The backend kills it (see `stopSessionBackgroundProcess`); on success
++ * the process leaves the row at once rather than on the next list poll, so a
++ * row held only by that process goes green the moment Stop confirms.
++ */
++
++import { stopSessionBackgroundProcess } from '@/api/sessions'
++import type { SessionInfo } from '@/types/hermes'
++
++import { notifyError } from './notifications'
++import { setMessagingSessions, setSessions } from './session'
++import { withoutBackgroundProcess } from './session-dot-state'
++
++const dropProcess = (rows: SessionInfo[], processId: string): SessionInfo[] => {
++  let changed = false
++
++  const next = rows.map(row => {
++    const updated = withoutBackgroundProcess(row, processId)
++    changed ||= updated !== row
++
++    return updated
++  })
++
++  return changed ? next : rows
++}
++
++/** Resolves true when the process is gone (killed now or already exited). */
++export async function stopRowBackgroundProcess(row: SessionInfo, processId: string): Promise<boolean> {
++  try {
++    await stopSessionBackgroundProcess(row, processId)
++  } catch (error) {
++    notifyError(error, 'Could not stop the process')
++
++    return false
++  }
++
++  setSessions(rows => dropProcess(rows, processId))
++  setMessagingSessions(rows => dropProcess(rows, processId))
++
++  return true
++}
+diff --git a/apps/desktop/src/store/session-dot-state.test.ts b/apps/desktop/src/store/session-dot-state.test.ts
+index 5ee7f8cbc4..faf44fdbb6 100644
+--- a/apps/desktop/src/store/session-dot-state.test.ts
++++ b/apps/desktop/src/store/session-dot-state.test.ts
+@@ -15,6 +15,7 @@ import {
+ } from './session'
+ import {
+   $backgroundActiveSessionIds,
++  $backgroundProcessesBySessionId,
+   $delegatingSessionIds,
+   $goalActiveSessionIds,
+   $kanbanBusySessionIds,
+@@ -24,6 +25,7 @@ import {
+   sessionStatusStripe,
+   showsRunningArc,
+   unreadSessionCount,
++  withoutBackgroundProcess,
+   withRowActivity
+ } from './session-dot-state'
+ import { clearAllSessionStates, publishSessionState } from './session-states'
+@@ -386,6 +388,60 @@ describe('backend-registered background process ($backgroundActiveSessionIds)',
+   })
+ })
+ 
++// [daveey] The row's process badge: which live processes hold it off green.
++describe('background processes a row lists ($backgroundProcessesBySessionId)', () => {
++  const sleep = { command: 'sleep 600', id: 'proc_a', started_at: 1_700_000_000 }
++
++  beforeEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++    $unreadFinishedSessionIds.set([])
++    $unreadWriteGuard.set(new Map())
++  })
++
++  afterEach(() => {
++    clearAllSessionStates()
++    $sessions.set([])
++  })
++
++  it('lists the process of a row held only by it, and drops it when the process exits', () => {
++    setSessions([storedRow('s1', { background_active: 1, background_processes: [sleep] }), storedRow('s2')])
++
++    expect($backgroundProcessesBySessionId.get()).toEqual({ s1: [sleep] })
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBeNull()
++
++    // The next list poll no longer stamps it: badge gone, row green.
++    setSessions([storedRow('s1'), storedRow('s2')])
++
++    expect($backgroundProcessesBySessionId.get()).toEqual({})
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++  })
++
++  it('a confirmed Stop drops the process from the row at once', () => {
++    const other = { command: 'gh run watch 1', id: 'proc_b' }
++    const row = storedRow('s1', { background_active: 2, background_processes: [sleep, other] })
++
++    const one = withoutBackgroundProcess(row, 'proc_a')
++    expect(one.background_processes).toEqual([other])
++    expect(one.background_active).toBe(1)
++
++    const none = withoutBackgroundProcess(one, 'proc_b')
++    setSessions([none])
++
++    expect(none.background_active).toBeUndefined()
++    expect($backgroundProcessesBySessionId.get()).toEqual({})
++    expect(sessionStatusStripe($sessionDotStateById.get()['s1'] ?? 'idle', true)).toBe('done')
++    // Control: an id the row doesn't list leaves it untouched.
++    expect(withoutBackgroundProcess(row, 'proc_zzz')).toBe(row)
++  })
++
++  it('falls back to count-only placeholders against an older backend', () => {
++    setSessions([storedRow('s1', { background_active: 2 })])
++
++    expect($backgroundProcessesBySessionId.get()['s1']?.map(p => p.id)).toEqual(['#0', '#1'])
++  })
++})
++
+ describe('standing goal in flight ($goalActiveSessionIds)', () => {
+   beforeEach(() => {
+     clearAllSessionStates()
+diff --git a/apps/desktop/src/store/session-dot-state.ts b/apps/desktop/src/store/session-dot-state.ts
+index 2725a12320..10ecc9d875 100644
+--- a/apps/desktop/src/store/session-dot-state.ts
++++ b/apps/desktop/src/store/session-dot-state.ts
+@@ -26,7 +26,7 @@
+ import { computed } from 'nanostores'
+ 
+ import { stableArray, stableRecord } from '@/lib/stable-array'
+-import type { SessionInfo } from '@/types/hermes'
++import type { SessionBackgroundProcess, SessionInfo } from '@/types/hermes'
+ 
+ import { $backgroundRunningSessionIds } from './composer-status'
+ import { $messagingSessions, $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
+@@ -109,6 +109,63 @@ export const $backgroundActiveSessionIds = computed([$sessions, $messagingSessio
+   return (backgroundActiveIds = stableArray(backgroundActiveIds, ids))
+ })
+ 
++// [daveey] WHAT keeps a row off green when it is a background process: the
++// backend lists each live process (`background_processes`) next to the count.
++// The sidebar row shows a process badge from this — a finished chat held only
++// by a 72 h watcher used to sit un-green with nothing on the row to say why.
++const NO_PROCESSES: readonly SessionBackgroundProcess[] = []
++
++/** The live background processes a row lists, oldest first. Falls back to
++ *  placeholder entries when an older backend stamped only the count. */
++export const rowBackgroundProcesses = (
++  row: Pick<SessionInfo, 'background_active' | 'background_processes'>
++): readonly SessionBackgroundProcess[] => {
++  if (row.background_processes?.length) {
++    return row.background_processes
++  }
++
++  const n = row.background_active ?? 0
++
++  return n > 0 ? Array.from({ length: n }, (_, i) => ({ command: '', id: `#${i}` })) : NO_PROCESSES
++}
++
++let backgroundProcessesById: Readonly<Record<string, readonly SessionBackgroundProcess[]>> = {}
++export const $backgroundProcessesBySessionId = computed([$sessions, $messagingSessions], (sessions, messaging) => {
++  const next: Record<string, readonly SessionBackgroundProcess[]> = {}
++
++  for (const rows of [sessions, messaging]) {
++    for (const row of rows) {
++      const procs = rowBackgroundProcesses(row)
++
++      if (procs.length > 0) {
++        next[row.id] = procs
++      }
++    }
++  }
++
++  return (backgroundProcessesById = stableRecord(backgroundProcessesById, next))
++})
++
++/** Drop a stopped process from a row at once (the next list poll confirms):
++ *  the badge loses it, and with nothing else holding it the row goes green. */
++export const withoutBackgroundProcess = (row: SessionInfo, processId: string): SessionInfo => {
++  const listed = row.background_processes ?? []
++
++  if (!listed.some(proc => proc.id === processId)) {
++    return row
++  }
++
++  const left = listed.filter(proc => proc.id !== processId)
++  const active = Math.max(0, (row.background_active ?? listed.length) - 1)
++  const { background_active: _a, background_processes: _p, ...rest } = row
++
++  return {
++    ...rest,
++    ...(active > 0 ? { background_active: active } : {}),
++    ...(left.length > 0 ? { background_processes: left } : {})
++  }
++}
++
+ // [daveey] Sessions with a standing `/goal` still active. Between goal turns —
+ // especially while the judge has parked it on a `wait` timer — no turn is live,
+ // so the sidebar read the session as done (green stripe) although the goal loop
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 25641f911a..0d5d09dff2 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -659,6 +659,9 @@ export interface SessionInfo {
+    *  row off "done" even when this window never polled the session. Absent
+    *  when zero or against an older backend. */
+   background_active?: number
++  /** [daveey] What those processes are (oldest first, capped): the sidebar's
++   *  process badge lists each command and its age, with a Stop button. */
++  background_processes?: SessionBackgroundProcess[]
+   /** [daveey] Set when this conversation's latest reply links an open GitHub
+    *  PR still waiting on a code review: `stuck` when the review is on the
+    *  viewer (or nobody / others asked >24h ago), `parked` when only other
+@@ -696,6 +699,17 @@ export interface SessionInfo {
+   connection_id?: string
+ }
+ 
++/** [daveey] One live background process a session row owns (backend stamp). */
++export interface SessionBackgroundProcess {
++  /** Process-registry id (`proc_…`), what Stop names. */
++  id: string
++  /** Redacted, whitespace-collapsed, truncated command line. */
++  command: string
++  /** Epoch seconds. */
++  started_at?: number
++  pid?: number
++}
++
+ export type TimelineDisplayMetadata =
+   | { model: string; provider?: string }
+   | {
+diff --git a/hermes_cli/process_session_activity.py b/hermes_cli/process_session_activity.py
+index 2b1aa2d48f..322bab3674 100644
+--- a/hermes_cli/process_session_activity.py
++++ b/hermes_cli/process_session_activity.py
+@@ -6,7 +6,9 @@ session after one of its tool events streamed into the window, so a turn the
+ backend resumed after a restart, or a process registered by another Hermes
+ process, left the row green while ``gh pr checks --watch`` was still running.
+ Session-list endpoints now stamp each row with how many live background
+-processes its lineage owns (``background_active``). [daveey]
++processes its lineage owns (``background_active``) and what they are
++(``background_processes``: id, command, start time), so the row can show WHY it
++is not done and stop a process from the sidebar. [daveey]
+ 
+ Sources: this process's registry (``tools.process_registry``) plus every
+ profile's ``processes.json`` checkpoint (shared by the Desktop backend, the
+@@ -29,8 +31,13 @@ _log = logging.getLogger(__name__)
+ _CACHE_TTL_S = 3.0
+ _cache_lock = threading.Lock()
+ _cache: tuple[float, dict[str, frozenset[str]]] | None = None
++_details: dict[str, dict[str, Any]] = {}
+ 
+ _SESSION_PREFIX = "session:"
++# Per-row detail list caps: the sidebar tooltip shows a handful, and the list
++# endpoint must stay small.
++_MAX_ROW_PROCESSES = 8
++_MAX_COMMAND_CHARS = 160
+ 
+ 
+ def _owner_ids(item: dict[str, Any]) -> set[str]:
+@@ -77,7 +84,27 @@ def _live(pid: Any, start: Any) -> bool:
+     return isinstance(pid, int) and pid > 0 and ProcessRegistry._host_pid_is_ours(pid, start)
+ 
+ 
++def _detail(proc_id: str, command: Any, started_at: Any, pid: Any) -> dict[str, Any]:
++    text = " ".join(str(command or "").split())
++    try:
++        from agent.redact import redact_sensitive_text
++
++        text = redact_sensitive_text(text, code_file=True)
++    except Exception:
++        pass
++    if len(text) > _MAX_COMMAND_CHARS:
++        text = text[: _MAX_COMMAND_CHARS - 1] + "\u2026"
++    out: dict[str, Any] = {"id": proc_id, "command": text or "background process"}
++    if isinstance(started_at, (int, float)) and started_at > 0:
++        out["started_at"] = float(started_at)
++    if isinstance(pid, int) and pid > 0:
++        out["pid"] = pid
++    return out
++
++
+ def _collect() -> dict[str, frozenset[str]]:
++    global _details
++    details: dict[str, dict[str, Any]] = {}
+     pairs: set[tuple[str, str]] = set()
+     try:
+         from tools.process_registry import process_registry
+@@ -90,6 +117,7 @@ def _collect() -> dict[str, frozenset[str]]:
+             item = {"session_key": s.session_key, "parent_session_id": s.parent_session_id,
+                     "owner_task_id": s.owner_task_id, "task_id": s.task_id}
+             pairs.update((sid, s.id) for sid in _owner_ids(item))
++            details[s.id] = _detail(s.id, s.command, s.started_at, s.pid)
+     except Exception:
+         _log.debug("in-process registry unavailable", exc_info=True)
+     for path in _checkpoint_paths():
+@@ -104,9 +132,12 @@ def _collect() -> dict[str, frozenset[str]]:
+                 continue
+             proc_id = str(item.get("session_id") or item.get("pid"))
+             pairs.update((sid, proc_id) for sid in _owner_ids(item))
++            details.setdefault(proc_id, _detail(proc_id, item.get("command"), item.get("started_at"),
++                                                item.get("pid")))
+     owned: dict[str, set[str]] = {}
+     for sid, proc in pairs:
+         owned.setdefault(sid, set()).add(proc)
++    _details = details
+     return {sid: frozenset(procs) for sid, procs in owned.items()}
+ 
+ 
+@@ -137,7 +168,9 @@ def _row_ids(row: dict[str, Any]) -> Iterable[str]:
+ 
+ def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+     """Stamp ``background_active`` on each session row (summed over its
+-    compression lineage; a process counts once per row). Never raises."""
++    compression lineage; a process counts once per row) and
++    ``background_processes`` (oldest first: id, command, started_at, pid).
++    Never raises."""
+     if not rows:
+         return rows
+     try:
+@@ -145,16 +178,80 @@ def annotate_background_activity(rows: list[dict[str, Any]]) -> list[dict[str, A
+     except Exception:
+         _log.debug("background activity unavailable", exc_info=True)
+         return rows
++    details = _details
+     for row in rows:
+-        n = len(set().union(*(owned.get(sid, ()) for sid in _row_ids(row))))
+-        if n:
+-            row["background_active"] = n
++        procs = set().union(*(owned.get(sid, ()) for sid in _row_ids(row)))
++        if procs:
++            row["background_active"] = len(procs)
++            listed = [details.get(p) or {"id": p, "command": "background process"} for p in procs]
++            listed.sort(key=lambda d: (d.get("started_at") or 0, d["id"]))
++            row["background_processes"] = listed[:_MAX_ROW_PROCESSES]
+         else:
+             row.pop("background_active", None)
++            row.pop("background_processes", None)
+     return rows
+ 
+ 
+-def _reset_cache_for_tests() -> None:
++def _checkpoint_entry(process_id: str) -> dict[str, Any] | None:
++    for path in _checkpoint_paths():
++        try:
++            entries = json.loads(path.read_text(encoding="utf-8-sig"))
++        except Exception:
++            continue
++        for item in entries if isinstance(entries, list) else ():
++            if isinstance(item, dict) and str(item.get("session_id") or "") == process_id:
++                return item
++    return None
++
++
++def stop_session_process(process_id: str, session_ids: Iterable[str]) -> dict[str, Any]:
++    """Kill one background process a sidebar row owns (``session_ids`` = the
++    row's id plus its lineage). A process in this backend's registry goes
++    through ``process_registry.kill_process`` — the ``process_manage kill``
++    path, so its completion receipt and checkpoint stay right. One supervised
++    by another Hermes process (messaging gateway, kanban worker, CLI) is only
++    reachable by pid: terminate its tree after re-checking the start time,
++    and its owner's reader sees the exit. Returns a ``kill_process``-shaped
++    dict (``status``: killed / already_exited / not_found / error)."""
++    process_id = str(process_id or "").strip()
++    wanted = {str(s).strip() for s in session_ids if str(s or "").strip()}
++    if not process_id or not wanted:
++        return {"status": "error", "error": "process_id and session_ids are required"}
++    try:
++        from tools.process_registry import ProcessRegistry, process_registry
++
++        session = process_registry.get(process_id)
++        if session is not None:
++            item = {"session_key": session.session_key, "parent_session_id": session.parent_session_id,
++                    "owner_task_id": session.owner_task_id, "task_id": session.task_id}
++            if not _owner_ids(item) & wanted:
++                return {"status": "not_found", "error": f"no such process: {process_id}"}
++            result = process_registry.kill_process(process_id, source="sidebar.stop")
++        else:
++            entry = _checkpoint_entry(process_id)
++            if entry is None or not _owner_ids(entry) & wanted:
++                return {"status": "not_found", "error": f"no such process: {process_id}"}
++            pid, start = entry.get("pid"), entry.get("host_start_time")
++            if entry.get("pid_scope", "host") != "host" or not _live(pid, start):
++                result = {"status": "already_exited", "session_id": process_id}
++            else:
++                ProcessRegistry._terminate_host_pid(pid, start)
++                deadline = time.monotonic() + 3.0
++                while _live(pid, start) and time.monotonic() < deadline:
++                    time.sleep(0.1)
++                result = ({"status": "error", "error": f"pid {pid} is still alive", "session_id": process_id}
++                          if _live(pid, start) else {"status": "killed", "session_id": process_id})
++    except Exception as exc:  # never 500 the sidebar
++        _log.warning("sidebar stop of %s failed", process_id, exc_info=True)
++        return {"status": "error", "error": str(exc)}
++    _invalidate_cache()  # the next list must not repaint the stopped process
++    return result
++
++
++def _invalidate_cache() -> None:
+     global _cache
+     with _cache_lock:
+         _cache = None
++
++
++_reset_cache_for_tests = _invalidate_cache
+diff --git a/hermes_cli/web_models.py b/hermes_cli/web_models.py
+index 4dea1d2a7b..e58741147c 100644
+--- a/hermes_cli/web_models.py
++++ b/hermes_cli/web_models.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import math
+ from typing import Any, Dict, List, Literal, Optional, Union
+ 
+-from pydantic import BaseModel, SecretStr, StrictBool, field_validator
++from pydantic import BaseModel, Field, SecretStr, StrictBool, field_validator
+ 
+ 
+ class ConfigUpdate(BaseModel):
+@@ -265,6 +265,13 @@ class SessionImport(BaseModel):
+     sessions: list[dict[str, Any]]
+     profile: Optional[str] = None
+ 
++
++class BackgroundProcessStop(BaseModel):
++    """Body of the sidebar's Stop on a row's background process: the row's
++    compression-lineage ids, any of which may own the process. [daveey]"""
++    session_ids: list[str] = Field(default_factory=list, max_length=200)
++
++
+ class SessionRename(BaseModel):
+     title: Optional[str] = None
+     archived: Optional[bool] = None
+diff --git a/hermes_cli/web_routers/sessions.py b/hermes_cli/web_routers/sessions.py
+index 9dcfc2dde0..5d8c95061e 100644
+--- a/hermes_cli/web_routers/sessions.py
++++ b/hermes_cli/web_routers/sessions.py
+@@ -23,12 +23,12 @@ from hermes_cli.web_deps import late
+ from hermes_cli.kanban_session_activity import annotate_kanban_activity, session_tasks as session_kanban_tasks
+ from hermes_cli.cron_session_activity import annotate_cron_activity
+ from hermes_cli.goal_session_activity import annotate_goal_activity
+-from hermes_cli.process_session_activity import annotate_background_activity
++from hermes_cli.process_session_activity import annotate_background_activity, stop_session_process
+ from hermes_cli.review_session_activity import annotate_review_wait
+ from hermes_cli.web_server_gateway import _strip_session_list_rows
+ from hermes_cli.web_server_sessions import _maybe_auto_archive_for_profile, _session_latest_descendant
+ from hermes_cli.web_models import (
+-    BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
++    BackgroundProcessStop, BulkDeleteSessions, SessionImport, SessionOwnerBackfill, SessionPrune, SessionRename)
+ from hermes_cli.web_routers._common import (
+     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
+ )
+@@ -848,6 +848,19 @@ async def get_session_messages_around(
+     return result
+ 
+ 
++@manage_router.post("/api/sessions/{session_id}/background-processes/{process_id}/stop")
++async def stop_session_background_process(session_id: str, process_id: str, body: BackgroundProcessStop):
++    """Kill one live background process the sidebar row ``session_id`` (plus the
++    lineage ids in ``session_ids``) owns: the Stop button on the row's process
++    badge. 404 when no such process belongs to the row. [daveey]"""
++    result = await asyncio.to_thread(stop_session_process, process_id, [session_id, *body.session_ids])
++    if result.get("status") == "not_found":
++        raise HTTPException(status_code=404, detail=result.get("error") or "no such process")
++    if result.get("status") == "error":
++        raise HTTPException(status_code=409, detail=result.get("error") or "stop failed")
++    return {"ok": True, "status": result.get("status"), "process_id": process_id}
++
++
+ @manage_router.delete("/api/sessions/{session_id}")
+ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None):
+     def _delete(db):
+diff --git a/tests/hermes_cli/test_process_session_activity.py b/tests/hermes_cli/test_process_session_activity.py
+index 2b2f5225e3..fd7dd80bb7 100644
+--- a/tests/hermes_cli/test_process_session_activity.py
++++ b/tests/hermes_cli/test_process_session_activity.py
+@@ -83,3 +83,71 @@ def test_in_process_registry_counts(home, sleeper):
+         host_start_time=ProcessRegistry._safe_host_start_time(live.pid), started_at=time.time())
+ 
+     assert psa.background_process_counts() == {"s_mem": 1}
++
++
++def test_rows_list_each_process_with_command_and_age(home, sleeper):
++    """The sidebar badge's tooltip: what the process is and how long it ran."""
++    a, b = sleeper(), sleeper()
++    (home / "processes.json").write_text(json.dumps([
++        {**_entry("proc_new", b.pid, session_key="s_w"), "command": "sleep 600", "started_at": 200.0},
++        {**_entry("proc_old", a.pid, session_key="s_w"), "command": "x " * 200, "started_at": 100.0},
++    ]))
++    rows = [{"id": "s_w"}, {"id": "s_idle", "background_processes": [{"id": "stale"}]}]
++
++    psa.annotate_background_activity(rows)
++
++    procs = rows[0]["background_processes"]
++    assert [p["id"] for p in procs] == ["proc_old", "proc_new"]  # oldest first
++    assert procs[1] == {"id": "proc_new", "command": "sleep 600", "started_at": 200.0, "pid": b.pid}
++    assert len(procs[0]["command"]) <= 160 and procs[0]["command"].endswith("\u2026")
++    assert "background_processes" not in rows[1]
++
++
++def test_stop_kills_checkpoint_process_owned_by_row_only(home, sleeper):
++    live = sleeper()
++    (home / "processes.json").write_text(json.dumps([_entry("proc_x", live.pid, session_key="s_own")]))
++
++    assert psa.stop_session_process("proc_x", ["s_other"])["status"] == "not_found"
++    assert live.poll() is None  # a row can't stop another row's process
++
++    psa.annotate_background_activity([{"id": "s_own"}])  # warm the cache
++    assert psa.stop_session_process("proc_x", ["s_own"])["status"] == "killed"
++    assert live.wait(timeout=5) is not None
++    rows = [{"id": "s_own"}]
++    psa.annotate_background_activity(rows)
++    assert "background_active" not in rows[0]  # cache dropped: the row goes green at once
++
++
++def test_stop_uses_registry_kill_for_in_process_sessions(home, sleeper, monkeypatch):
++    import tools.process_registry as pr
++
++    live = sleeper()
++    pr.process_registry._running["proc_mem"] = ProcessSession(
++        id="proc_mem", command="sleep 600", task_id="default", session_key="s_mem", pid=live.pid,
++        host_start_time=ProcessRegistry._safe_host_start_time(live.pid), started_at=time.time())
++    calls = []
++    monkeypatch.setattr(pr.process_registry, "kill_process",
++                        lambda pid, source="": calls.append((pid, source)) or {"status": "killed"})
++
++    assert psa.stop_session_process("proc_mem", ["s_mem"]) == {"status": "killed"}
++    assert calls == [("proc_mem", "sidebar.stop")]
++
++
++def test_stop_endpoint(home, sleeper):
++    try:
++        from starlette.testclient import TestClient
++    except ImportError:
++        pytest.skip("fastapi/starlette not installed")
++    from hermes_cli.web_server import app, _SESSION_HEADER_NAME, _SESSION_TOKEN
++
++    live = sleeper()
++    (home / "processes.json").write_text(json.dumps([_entry("proc_e", live.pid, session_key="s_root")]))
++    client = TestClient(app)
++    client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
++    url = "/api/sessions/s_tip/background-processes/proc_e/stop"
++
++    assert client.post(url, json={}).status_code == 404  # tip alone doesn't own it
++    res = client.post(url, json={"session_ids": ["s_root"]})
++
++    assert res.status_code == 200 and res.json()["status"] == "killed"
++    assert live.wait(timeout=5) is not None
+-- 
+2.54.0 (Apple Git-157)
+

@@ -30,8 +30,9 @@ PRIME = bytes.fromhex("ffffffffffffffffc90fdaa22168c234c4c6628b80dc1cd129024e088
 class FakeServer:
     """Apple-flavoured RFB server: type 30 auth, 8x4 framebuffer, records pointer/key events."""
 
-    def __init__(self, user="alice", password="s3cret", w=8, h=4, zlib_enc=True):
+    def __init__(self, user="alice", password="s3cret", w=8, h=4, zlib_enc=True, partial=False):
         self.user, self.password, self.w, self.h, self.zlib_enc = user, password, w, h, zlib_enc
+        self.partial = partial  # multi-display Mac: only the "display" rect (top half) is ever sent
         self.events: list[tuple] = []
         self.got_creds: tuple[str, str] | None = None
         self.sock = socket.socket()
@@ -84,9 +85,11 @@ class FakeServer:
                 top = bytes([0, 0, 255, 0]) * (self.w * half)
                 bot = bytes([255, 0, 0, 0]) * (self.w * (self.h - half))
                 c.sendall(bytes([3, 0, 0, 0]) + struct.pack(">I", 1) + b"x")  # cut text first, must be skipped
-                out = struct.pack(">BxH", 0, 2)
+                out = struct.pack(">BxH", 0, 1 if self.partial else 2)
                 out += struct.pack(">HHHHi", 0, 0, self.w, half, 0) + top
-                if self.zlib_enc:
+                if self.partial:
+                    pass
+                elif self.zlib_enc:
                     data = z.compress(bot) + z.flush(zlib.Z_SYNC_FLUSH)
                     out += struct.pack(">HHHHiI", 0, half, self.w, self.h - half, 6, len(data)) + data
                 else:
@@ -118,6 +121,19 @@ def test_login_screenshot_and_input(zlib_enc):
     assert keys[:4] == [("key", 1, 0xFFE7), ("key", 1, ord("a")), ("key", 0, ord("a")), ("key", 0, 0xFFE7)]
     assert ("key", 1, 0xFFE1) in keys and ("key", 1, ord("H")) in keys and ("key", 1, ord("i")) in keys
     assert srv.got_creds == ("alice", "s3cret")
+
+
+def test_screenshot_returns_partial_multi_display_frame(monkeypatch):
+    # A Mac with two displays reports their bounding box but never sends the dead corners; the client
+    # must return the frame once the server goes quiet instead of waiting out the timeout.
+    import time
+    monkeypatch.setattr(rfb.RFBClient, "UPDATE_GRACE_S", 0.3)
+    srv = FakeServer(partial=True)
+    with rfb.RFBClient("127.0.0.1", srv.port, user="alice", password="s3cret", timeout=5) as c:
+        t = time.time()
+        img = c.screenshot().to_image()
+        assert time.time() - t < 3
+    assert img.getpixel((0, 0)) == (255, 0, 0) and img.getpixel((7, 3)) == (0, 0, 0)
 
 
 def test_bad_password_raises():

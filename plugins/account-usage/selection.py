@@ -383,6 +383,20 @@ def _runtime_server(server=None):
     return server
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def _continuation_chains(home, ids):
     """Read-only compression aliases; explicit branch/reset/delegate edges stop.
 
@@ -397,7 +411,7 @@ def _continuation_chains(home, ids):
     path = Path(home) / 'state.db'
     if not path.exists():
         return {sid: [sid] for sid in ids}
-    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+    with closing(_ro_connect(path, timeout=5)) as db:
         db.row_factory = sqlite3.Row
         db.execute('BEGIN')
         def row(sid):
@@ -458,7 +472,7 @@ def _mirror_route(home, session):
     path = Path(home) / 'state.db'
     if not key or not path.exists():
         raise SelectionRejected('Compute chat metadata is not ready; retry after the first turn')
-    with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+    with closing(_ro_connect(path, timeout=5)) as db:
         row = db.execute('SELECT model,model_config FROM sessions WHERE id=?', (key,)).fetchone()
     if not row:
         raise SelectionRejected('Compute chat metadata is unavailable')

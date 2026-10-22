@@ -1,0 +1,445 @@
+From 9778500b6b903b523fb48a434647297d648f9400 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:22:36 -0700
+Subject: [PATCH] fix(env): top-level launches strip the whole agent-scope env
+ family, one shared list [daveey]
+
+Hermes.app pid 59331 (reopened by a kanban worker's `hermes update`) carried not only
+HERMES_DELEGATED_CHILD_CONTEXT + HERMES_KANBAN_* (already stripped since 4eff2691da) but
+HERMES_SESSION_ID/SOURCE, HERMES_SINGLE_QUERY_SESSION and HERMES_SUPERVISED_CHILD, which
+leak the worker's session identity and supervision mode into every Desktop backend.
+
+The list now lives in agent/delegation_context.py (strip_agent_scope_env, next to
+scrub_kanban_env): exact keys HERMES_DELEGATED_CHILD_CONTEXT / SINGLE_QUERY_SESSION / SPAWN /
+SUPERVISED_CHILD plus the HERMES_KANBAN_/SESSION_/CRON_/PARENT_/RPC_/KERNEL_ prefixes,
+keeping operator tunables (*_TIMEOUT, *_SECONDS, *_MAX_PARALLEL...). Still gated on a worker
+marker so a deliberate board pin is untouched. top_level_env (CLI entry for
+serve/dashboard/desktop/gui/gateway and the post-update Desktop reopen) uses it; the Electron
+main mirror is drift-tested against it.
+
+Why the worker shell had the marker at all: delegated_child_subprocess_env() adds
+HERMES_DELEGATED_CHILD_CONTEXT to every subprocess a dispatcher worker spawns (terminal,
+execute_code, MCP, LSP) by design, so its descendants can't mutate the board. A
+`hermes update` in a worker's terminal therefore always carries it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/delegation_context.py                   |  57 +++++++
+ .../electron/leaked-worker-env.test.ts        |  38 +++++
+ apps/desktop/electron/leaked-worker-env.ts    |  44 ++++--
+ hermes_cli/top_level_env.py                   |  37 ++---
+ tests/hermes_cli/test_agent_scope_env.py      | 148 ++++++++++++++++++
+ 5 files changed, 283 insertions(+), 41 deletions(-)
+ create mode 100644 tests/hermes_cli/test_agent_scope_env.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index ef2a465856..d1e0b113eb 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -8,6 +8,7 @@ closed for them without mutating the process-global environment.
+ from __future__ import annotations
+ 
+ import os
++import re
+ from contextlib import contextmanager
+ from contextvars import ContextVar, Token
+ from typing import Iterator, Mapping, MutableMapping, overload
+@@ -24,6 +25,62 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
+     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+ )
+ 
++# --- Agent-scope env: what a top-level surface must never inherit. [daveey] -----------------
++# A worker's terminal subprocesses carry DELEGATED_CHILD_ENV_MARKER by design
++# (``delegated_child_subprocess_env``), plus the worker's session/kanban/cron/RPC identity.
++# When one of them launched Hermes Desktop (a worker's ``hermes update`` reopening the app with
++# ``open``), every chat became a fenced "delegate child" (Hermes.app pid 59331, 2026-10-21).
++# A Desktop, ``serve``/``dashboard`` backend or gateway is never a worker, so each strips this
++# family at launch. Mirrored in apps/desktop/electron/leaked-worker-env.ts (drift-tested).
++#
++# Presence of any marker means the env was inherited from a worker or delegate child. Without
++# a marker nothing is stripped: a board pin or session var set alone is an operator choice.
++AGENT_SCOPE_MARKER_KEYS: tuple[str, ...] = (
++    DELEGATED_CHILD_ENV_MARKER,
++    "HERMES_KANBAN_TASK",
++    "HERMES_KANBAN_WORKSPACE",
++    "HERMES_KANBAN_RUN_ID",
++    "HERMES_KANBAN_CLAIM_LOCK",
++)
++AGENT_SCOPE_EXACT_KEYS: tuple[str, ...] = (
++    DELEGATED_CHILD_ENV_MARKER,
++    "HERMES_SINGLE_QUERY_SESSION",
++    "HERMES_SPAWN",
++    "HERMES_SUPERVISED_CHILD",
++)
++AGENT_SCOPE_PREFIXES: tuple[str, ...] = (
++    "HERMES_KANBAN_",
++    "HERMES_SESSION_",
++    "HERMES_CRON_",
++    "HERMES_PARENT_",
++    "HERMES_RPC_",
++    "HERMES_KERNEL_",
++)
++# Operator tunables sharing those prefixes (HERMES_CRON_TIMEOUT, HERMES_SESSION_STALL_TIMEOUT,
++# HERMES_CRON_MAX_PARALLEL, HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS...) are config, not identity.
++AGENT_SCOPE_TUNABLE_RE = re.compile(r"(_TIMEOUT|_TIMEOUT_S|_POLL_S|_SECONDS|_MAX_PARALLEL)$")
++
++
++def is_agent_scope_env_key(key: str) -> bool:
++    """Whether *key* belongs to a worker/delegate/session identity (not an operator tunable)."""
++    if key in AGENT_SCOPE_EXACT_KEYS:
++        return True
++    return key.startswith(AGENT_SCOPE_PREFIXES) and not AGENT_SCOPE_TUNABLE_RE.search(key)
++
++
++def strip_agent_scope_env(env: MutableMapping[str, str]) -> list[str]:
++    """Remove the agent-scope family from *env* in place when a worker marker is present.
++
++    Returns the removed key names (empty when nothing leaked). The single list every top-level
++    launch path (CLI entry, Desktop relaunch, Electron main, hermes-sync) uses.
++    """
++    if not any(env.get(key) for key in AGENT_SCOPE_MARKER_KEYS):
++        return []
++    removed = [key for key in list(env) if is_agent_scope_env_key(key)]
++    for key in removed:
++        env.pop(key, None)
++    return removed
++
+ 
+ @contextmanager
+ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+diff --git a/apps/desktop/electron/leaked-worker-env.test.ts b/apps/desktop/electron/leaked-worker-env.test.ts
+index e290342b66..89b8967852 100644
+--- a/apps/desktop/electron/leaked-worker-env.test.ts
++++ b/apps/desktop/electron/leaked-worker-env.test.ts
+@@ -23,6 +23,44 @@ describe('scrubLeakedWorkerEnv', () => {
+     expect(env).toEqual({ PATH: '/bin' })
+   })
+ 
++  it('drops the whole agent-scope family the leaked Desktop carried, keeping tunables', () => {
++    const env: NodeJS.ProcessEnv = {
++      HERMES_CRON_TIMEOUT: '900',
++      HERMES_DELEGATED_CHILD_CONTEXT: '/Users/x/.hermes',
++      HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS: '60',
++      HERMES_KANBAN_WORKSPACE: '/w/t_45d5a361',
++      HERMES_KERNEL_DIR: '/tmp/k',
++      HERMES_PARENT_PID: '84584',
++      HERMES_RPC_TOKEN: 'tok',
++      HERMES_SESSION_ID: '20261021_185223_3c48bc',
++      HERMES_SESSION_SOURCE: 'kanban',
++      HERMES_SESSION_STALL_TIMEOUT: '600',
++      HERMES_SINGLE_QUERY_SESSION: '1',
++      HERMES_SPAWN: '1',
++      HERMES_SUPERVISED_CHILD: '1',
++      PATH: '/bin'
++    }
++
++    expect(scrubLeakedWorkerEnv(env).sort()).toEqual([
++      'HERMES_DELEGATED_CHILD_CONTEXT',
++      'HERMES_KANBAN_WORKSPACE',
++      'HERMES_KERNEL_DIR',
++      'HERMES_PARENT_PID',
++      'HERMES_RPC_TOKEN',
++      'HERMES_SESSION_ID',
++      'HERMES_SESSION_SOURCE',
++      'HERMES_SINGLE_QUERY_SESSION',
++      'HERMES_SPAWN',
++      'HERMES_SUPERVISED_CHILD'
++    ])
++    expect(env).toEqual({
++      HERMES_CRON_TIMEOUT: '900',
++      HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS: '60',
++      HERMES_SESSION_STALL_TIMEOUT: '600',
++      PATH: '/bin'
++    })
++  })
++
+   it('keeps a deliberate board pin when no worker marker is present', () => {
+     const env: NodeJS.ProcessEnv = { HERMES_KANBAN_BOARD: 'x', HERMES_KANBAN_DB: '/tmp/k.db' }
+ 
+diff --git a/apps/desktop/electron/leaked-worker-env.ts b/apps/desktop/electron/leaked-worker-env.ts
+index af5bc406bd..f200936d1c 100644
+--- a/apps/desktop/electron/leaked-worker-env.ts
++++ b/apps/desktop/electron/leaked-worker-env.ts
+@@ -2,8 +2,9 @@
+ // reopening the app with `open`) inherits that worker's identity env. Every backend, terminal
+ // and CLI the Desktop spawns would then believe it is that worker's delegate child: kanban tools
+ // refuse ("delegate_task child contexts cannot mutate Kanban") and the board is pinned to the
+-// worker's DB (2026-10-21, Hermes.app pid 59331). The Desktop is never a worker, so drop them at
+-// startup. Mirrors hermes_cli/top_level_env.py. [daveey]
++// worker's DB (2026-10-21, Hermes.app pid 59331). The Desktop is never a worker, so drop the
++// whole agent-scope family at startup. Mirrors agent/delegation_context.py
++// (strip_agent_scope_env); tests/hermes_cli/test_agent_scope_env.py fails on drift. [daveey]
+ 
+ // Presence of any of these means the env was inherited from a worker or delegate child.
+ export const WORKER_MARKER_KEYS = [
+@@ -14,24 +15,41 @@ export const WORKER_MARKER_KEYS = [
+   'HERMES_KANBAN_CLAIM_LOCK'
+ ] as const
+ 
+-// Board pins are only dropped together with a marker: set alone they are an operator choice.
+-export const WORKER_ENV_KEYS = [
+-  ...WORKER_MARKER_KEYS,
+-  'HERMES_KANBAN_BRANCH',
+-  'HERMES_KANBAN_GOAL_MODE',
+-  'HERMES_KANBAN_GOAL_MAX_TURNS',
+-  'HERMES_KANBAN_DB',
+-  'HERMES_KANBAN_BOARD',
+-  'HERMES_KANBAN_WORKSPACES_ROOT'
++export const AGENT_SCOPE_EXACT_KEYS = [
++  'HERMES_DELEGATED_CHILD_CONTEXT',
++  'HERMES_SINGLE_QUERY_SESSION',
++  'HERMES_SPAWN',
++  'HERMES_SUPERVISED_CHILD'
++] as const
++
++export const AGENT_SCOPE_PREFIXES = [
++  'HERMES_KANBAN_',
++  'HERMES_SESSION_',
++  'HERMES_CRON_',
++  'HERMES_PARENT_',
++  'HERMES_RPC_',
++  'HERMES_KERNEL_'
+ ] as const
+ 
+-/** Remove leaked worker identity keys from `env` in place; returns the removed key names. */
++// Operator tunables sharing those prefixes are config, not identity: keep them.
++export const AGENT_SCOPE_TUNABLE_RE = /(_TIMEOUT|_TIMEOUT_S|_POLL_S|_SECONDS|_MAX_PARALLEL)$/
++
++export function isAgentScopeEnvKey(key: string): boolean {
++  if ((AGENT_SCOPE_EXACT_KEYS as readonly string[]).includes(key)) {
++    return true
++  }
++
++  return AGENT_SCOPE_PREFIXES.some(prefix => key.startsWith(prefix)) && !AGENT_SCOPE_TUNABLE_RE.test(key)
++}
++
++/** Remove leaked agent-scope keys from `env` in place; returns the removed key names. Without a
++ * worker marker nothing is removed: a board pin or session var set alone is an operator choice. */
+ export function scrubLeakedWorkerEnv(env: NodeJS.ProcessEnv = process.env): string[] {
+   if (!WORKER_MARKER_KEYS.some(key => Boolean(env[key]))) {
+     return []
+   }
+ 
+-  const removed = WORKER_ENV_KEYS.filter(key => key in env)
++  const removed = Object.keys(env).filter(isAgentScopeEnvKey)
+ 
+   for (const key of removed) {
+     delete env[key]
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index ffbf7603d1..a8aae5da67 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -15,24 +15,10 @@ from __future__ import annotations
+ import os
+ from typing import MutableMapping, Optional, Sequence
+ 
+-# Presence of any of these means the env was inherited from a worker or delegate child.
+-WORKER_MARKER_KEYS: tuple[str, ...] = (
+-    "HERMES_DELEGATED_CHILD_CONTEXT",
+-    "HERMES_KANBAN_TASK",
+-    "HERMES_KANBAN_WORKSPACE",
+-    "HERMES_KANBAN_RUN_ID",
+-    "HERMES_KANBAN_CLAIM_LOCK",
+-)
+-# Dispatcher-injected worker env (``kanban_db_dispatch._default_spawn``). The board pins are
+-# only stripped together with a marker: set alone they are a deliberate operator choice.
+-WORKER_ENV_KEYS: tuple[str, ...] = (
+-    *WORKER_MARKER_KEYS,
+-    "HERMES_KANBAN_BRANCH",
+-    "HERMES_KANBAN_GOAL_MODE",
+-    "HERMES_KANBAN_GOAL_MAX_TURNS",
+-    "HERMES_KANBAN_DB",
+-    "HERMES_KANBAN_BOARD",
+-    "HERMES_KANBAN_WORKSPACES_ROOT",
++# The key family and the marker rule live in agent/delegation_context.py so they can't drift.
++from agent.delegation_context import (
++    AGENT_SCOPE_MARKER_KEYS as WORKER_MARKER_KEYS,
++    strip_agent_scope_env,
+ )
+ 
+ # First positional argv of a top-level surface (never a worker).
+@@ -40,15 +26,10 @@ TOP_LEVEL_COMMANDS = frozenset({"serve", "dashboard", "gui", "desktop", "gateway
+ 
+ 
+ def scrub_leaked_worker_env(environ: Optional[MutableMapping[str, str]] = None) -> list[str]:
+-    """Remove worker/delegate identity keys from ``environ`` (default ``os.environ``) when any
+-    worker marker is present. Returns the removed key names (empty when nothing leaked)."""
+-    env = os.environ if environ is None else environ
+-    if not any(env.get(key) for key in WORKER_MARKER_KEYS):
+-        return []
+-    removed = [key for key in WORKER_ENV_KEYS if key in env]
+-    for key in removed:
+-        env.pop(key, None)
+-    return removed
++    """Remove the agent-scope env family (worker/delegate/session/cron/RPC identity) from
++    ``environ`` (default ``os.environ``) when any worker marker is present. Returns the removed
++    key names (empty when nothing leaked)."""
++    return strip_agent_scope_env(os.environ if environ is None else environ)
+ 
+ 
+ def clean_launch_env(base: Optional[MutableMapping[str, str]] = None) -> dict[str, str]:
+@@ -71,6 +52,6 @@ def scrub_for_top_level_launch(argv: Sequence[str]) -> list[str]:
+         import logging
+ 
+         logging.getLogger(__name__).warning(
+-            "hermes %s: dropped inherited worker env %s (launched from a kanban worker/delegate child)",
++            "hermes %s: dropped inherited agent-scope env %s (launched from a kanban worker/delegate child)",
+             _first_positional(argv), ", ".join(removed))
+     return removed
+diff --git a/tests/hermes_cli/test_agent_scope_env.py b/tests/hermes_cli/test_agent_scope_env.py
+new file mode 100644
+index 0000000000..6e65995d97
+--- /dev/null
++++ b/tests/hermes_cli/test_agent_scope_env.py
+@@ -0,0 +1,148 @@
++"""A Desktop/backend launched from a kanban worker's shell must not inherit ANY agent-scope env. [daveey]
++
++2026-10-21: a worker's ``hermes update`` reopened Hermes.app (pid 59331) with ``open``; the app
++inherited HERMES_DELEGATED_CHILD_CONTEXT, HERMES_KANBAN_*, HERMES_SESSION_ID/SOURCE,
++HERMES_SINGLE_QUERY_SESSION and HERMES_SUPERVISED_CHILD, so every Desktop chat was fenced as a
++delegate child and kanban mutations were refused. The scope list lives in one helper in
++``agent/delegation_context.py`` (``strip_agent_scope_env``); the Electron main mirrors it.
++"""
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++
++import pytest
++
++REPO = Path(__file__).resolve().parents[2]
++
++# The env the leaked Desktop actually carried (ps eww 59331), plus the rest of the scope family.
++POISON = {
++    "HERMES_DELEGATED_CHILD_CONTEXT": "/Users/x/.hermes",
++    "HERMES_KANBAN_TASK": "t_45d5a361",
++    "HERMES_KANBAN_WORKSPACE": "/Users/x/.hermes/kanban/workspaces/t_45d5a361",
++    "HERMES_KANBAN_DB": "/Users/x/.hermes/kanban.db",
++    "HERMES_KANBAN_BOARD": "default",
++    "HERMES_KANBAN_WORKSPACES_ROOT": "/Users/x/.hermes/kanban/workspaces",
++    "HERMES_KANBAN_RUN_ID": "2848",
++    "HERMES_SESSION_ID": "20261021_185223_3c48bc",
++    "HERMES_SESSION_SOURCE": "kanban",
++    "HERMES_SESSION_KEY": "k",
++    "HERMES_SINGLE_QUERY_SESSION": "1",
++    "HERMES_SUPERVISED_CHILD": "1",
++    "HERMES_CRON_SESSION": "1",
++    "HERMES_PARENT_PID": "84584",
++    "HERMES_PARENT_START_MARKER": "x",
++    "HERMES_SPAWN": "1",
++    "HERMES_RPC_TOKEN": "tok",
++    "HERMES_RPC_SOCKET": "/tmp/s",
++    "HERMES_KERNEL_DIR": "/tmp/k",
++}
++# Operator tunables share those prefixes but are configuration, not identity: keep them.
++TUNABLES = {
++    "HERMES_SESSION_STALL_TIMEOUT": "600",
++    "HERMES_CRON_TIMEOUT": "900",
++    "HERMES_CRON_MAX_PARALLEL": "2",
++    "HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS": "60",
++}
++SAFE = {"PATH": "/bin", "HOME": "/Users/x", "HERMES_HOME": "/Users/x/.hermes"}
++
++
++def test_strip_agent_scope_env_removes_whole_family_keeps_tunables():
++    from agent.delegation_context import strip_agent_scope_env
++    env = {**SAFE, **TUNABLES, **POISON}
++    removed = strip_agent_scope_env(env)
++    assert set(removed) == set(POISON)
++    assert env == {**SAFE, **TUNABLES}
++
++
++def test_strip_agent_scope_env_is_noop_without_worker_marker():
++    """Without a worker/delegate marker, session or board env is a deliberate operator setting."""
++    from agent.delegation_context import strip_agent_scope_env
++    env = {**SAFE, "HERMES_KANBAN_DB": "/tmp/k.db", "HERMES_SESSION_SOURCE": "desktop",
++           "HERMES_SUPERVISED_CHILD": "1"}
++    before = dict(env)
++    assert strip_agent_scope_env(env) == []
++    assert env == before
++
++
++def test_relaunch_with_poisoned_environ_passes_clean_env(monkeypatch, tmp_path):
++    from hermes_cli import main_desktop as md
++    for k, v in {**POISON, **TUNABLES}.items():
++        monkeypatch.setenv(k, v)
++    exe = tmp_path / "Hermes.app" / "Contents" / "MacOS" / "Hermes"
++    exe.parent.mkdir(parents=True)
++    exe.write_text("")
++    monkeypatch.setattr(md, "_desktop_packaged_executable", lambda d: exe)
++    monkeypatch.setattr(md, "_desktop_relaunch_after_rebuild_enabled", lambda: True)
++    monkeypatch.setattr(md.sys, "platform", "darwin")
++    calls = []
++    monkeypatch.setattr(md.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
++    md._relaunch_stopped_desktops(tmp_path, [[]])
++    assert calls, "desktop was not reopened"
++    env = calls[0][1].get("env")
++    assert env is not None
++    assert not (set(POISON) & set(env)), sorted(set(POISON) & set(env))
++    assert all(env.get(k) == v for k, v in TUNABLES.items())
++
++
++@pytest.mark.parametrize("argv", [["serve"], ["desktop"], ["dashboard"], ["gateway", "run"]])
++def test_backend_started_with_marker_is_not_a_delegate_child(monkeypatch, argv):
++    from agent.delegation_context import is_delegated_child_process_context
++    from hermes_cli.top_level_env import scrub_for_top_level_launch
++    for k, v in POISON.items():
++        monkeypatch.setenv(k, v)
++    assert is_delegated_child_process_context()
++    scrub_for_top_level_launch(argv)
++    assert not is_delegated_child_process_context()
++    assert not (set(POISON) & set(os.environ))
++
++
++def test_chat_kanban_comment_succeeds_after_top_level_scrub(monkeypatch, tmp_path):
++    """End to end: a chat in a backend launched with the leaked env can comment on a card."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    poison = {**POISON, "HERMES_DELEGATED_CHILD_CONTEXT": str(home),
++              "HERMES_KANBAN_DB": str(home / "kanban.db")}
++    for k, v in poison.items():
++        monkeypatch.setenv(k, v)
++    monkeypatch.setenv("HERMES_HOME", str(home))
++
++    from hermes_cli import kanban_db as kb
++    from tools import kanban_tools as kt
++
++    def comment(tid: str) -> dict:
++        try:
++            return json.loads(kt._handle_comment({"task_id": tid, "body": "from chat"}))
++        except Exception as exc:  # a _Reject propagates as an exception in some paths
++            return {"error": str(exc)}
++
++    from hermes_cli.top_level_env import scrub_for_top_level_launch
++    scrub_for_top_level_launch(["serve"])
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="chat target", assignee="someone")
++    finally:
++        conn.close()
++    out = comment(tid)
++    assert out.get("ok") is True, out
++
++
++def _ts_list(name: str, src: str) -> set[str]:
++    m = re.search(rf"export const {name}\s*=\s*\[(.*?)\]", src, re.DOTALL)
++    assert m, f"{name} missing from leaked-worker-env.ts"
++    return set(re.findall(r"'([A-Z0-9_]+)'", m.group(1)))
++
++
++def test_electron_mirror_matches_python_scope_list():
++    from agent import delegation_context as dc
++    src = (REPO / "apps/desktop/electron/leaked-worker-env.ts").read_text()
++    assert _ts_list("WORKER_MARKER_KEYS", src) == set(dc.AGENT_SCOPE_MARKER_KEYS)
++    assert _ts_list("AGENT_SCOPE_EXACT_KEYS", src) == set(dc.AGENT_SCOPE_EXACT_KEYS)
++    assert _ts_list("AGENT_SCOPE_PREFIXES", src) == set(dc.AGENT_SCOPE_PREFIXES)
++    m = re.search(r"AGENT_SCOPE_TUNABLE_RE\s*=\s*/(.*?)/", src)
++    assert m and m.group(1) == dc.AGENT_SCOPE_TUNABLE_RE.pattern
+-- 
+2.54.0 (Apple Git-157)
+

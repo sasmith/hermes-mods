@@ -12,3 +12,9 @@ def _no_system_one_network(monkeypatch, tmp_path):
     # creates a real Kanban card or makes a real strong-model call.
     monkeypatch.setenv("COACH_FIXLOOP_REVIEW", "0")
     monkeypatch.setenv("COACH_DIFF_REVIEW", "0")
+    # Self-heal judges call the aux model: off unless a test opts in with a fake judge.
+    monkeypatch.setenv("COACH_SELFHEAL", "off")
+    # The self-heal lane never runs real `hermes kanban` / `hermes inbox` / ssh from tests (inject a runner).
+    monkeypatch.setenv("COACH_SELFHEAL_NO_EXEC", "1")
+    monkeypatch.delenv("COACH_SELFHEAL_HUB", raising=False)
+    monkeypatch.delenv("COACH_SELFHEAL_IS_HUB", raising=False)

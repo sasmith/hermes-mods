@@ -319,5 +319,267 @@ class FocusGuardTest(unittest.TestCase):
             self.assertLess(hca.show_age(), 5)
 
 
+class FocusFilterRules(unittest.TestCase):
+    """Pure rewrite rules of the CDP focus filter (no sockets)."""
+
+    def f(self, m, show=False):
+        return hca.filter_cdp_message(m, show)
+
+    def test_foreground_create_target_forced_to_background(self):
+        act, out = self.f({"id": 3, "method": "Target.createTarget", "params": {"url": "https://x.com/"}})
+        self.assertEqual(act, "forward")
+        self.assertEqual(out, {"id": 3, "method": "Target.createTarget",
+                               "params": {"url": "https://x.com/", "background": True, "newWindow": True}})
+
+    def test_create_target_focus_true_dropped(self):
+        act, out = self.f({"id": 4, "method": "Target.createTarget",
+                           "params": {"url": "", "background": True, "focus": True}, "sessionId": "S"})
+        self.assertEqual(act, "forward")
+        self.assertEqual(out["params"], {"url": "", "background": True, "newWindow": True})
+        self.assertEqual(out["sessionId"], "S")
+
+    def test_background_create_target_gets_own_window_quietly(self):
+        # Chrome stalls Page.enable on a background tab inside an existing window; alone in a window it loads.
+        self.assertEqual(self.f({"id": 5, "method": "Target.createTarget", "params": {"url": "", "background": True}}),
+                         ("window", {"id": 5, "method": "Target.createTarget",
+                                     "params": {"url": "", "background": True, "newWindow": True}}))
+
+    def test_background_window_and_hidden_targets_untouched(self):
+        self.assertIsNone(self.f({"id": 5, "method": "Target.createTarget",
+                                  "params": {"url": "", "background": True, "newWindow": True}}))
+        self.assertIsNone(self.f({"id": 5, "method": "Target.createTarget",
+                                  "params": {"url": "", "background": True, "hidden": True}}))
+
+    def test_activate_target_answered_locally(self):
+        self.assertEqual(self.f({"id": 6, "method": "Target.activateTarget", "params": {"targetId": "T"}}),
+                         ("reply", {"id": 6, "result": {}}))
+
+    def test_bring_to_front_answered_locally_with_session(self):
+        self.assertEqual(self.f({"id": 7, "method": "Page.bringToFront", "sessionId": "S1"}),
+                         ("reply", {"id": 7, "result": {}, "sessionId": "S1"}))
+
+    def test_other_methods_untouched(self):
+        self.assertIsNone(self.f({"id": 8, "method": "Runtime.evaluate", "params": {"expression": "1"}}))
+
+    def test_show_flag_bypasses_every_rule(self):
+        for m in ({"id": 1, "method": "Target.createTarget", "params": {"url": ""}},
+                  {"id": 2, "method": "Target.activateTarget", "params": {"targetId": "T"}},
+                  {"id": 3, "method": "Page.bringToFront"}):
+            self.assertIsNone(self.f(m, show=True), m)
+
+    def test_http_rules(self):
+        self.assertEqual(hca.filter_http("GET", "/json/activate/ABC", False), ("activate", "ABC"))
+        self.assertEqual(hca.filter_http("PUT", "/json/new?https://x.com/a?b=1", False),
+                         ("new", "https://x.com/a?b=1"))
+        self.assertEqual(hca.filter_http("PUT", "/json/new", False), ("new", ""))
+        self.assertEqual(hca.filter_http("PUT", "/json/new?https%3A%2F%2Fx.com%2F", False), ("new", "https://x.com/"))
+        self.assertIsNone(hca.filter_http("GET", "/json/list", False))
+        self.assertIsNone(hca.filter_http("GET", "/json/version", False))
+        self.assertIsNone(hca.filter_http("GET", "/json/activate/ABC", True))
+        self.assertIsNone(hca.filter_http("PUT", "/json/new?about:blank", True))
+
+    def test_show_active_respects_flag_and_expiry(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        with mock.patch.object(hca, "SHOW_FLAG", os.path.join(d, "show")):
+            self.assertFalse(hca.show_active())
+            open(hca.SHOW_FLAG, "w").close()                       # `show` with no deadline
+            self.assertTrue(hca.show_active())
+            with open(hca.SHOW_FLAG, "w") as f:
+                f.write("%f" % (time.time() - 5))                   # `show --minutes N` that ran out
+            self.assertFalse(hca.show_active())
+
+    def test_chrome_listens_on_internal_port(self):
+        self.assertNotEqual(hca.CHROME_PORT, hca.PORT)
+
+
+class FakeChrome:
+    """Loopback stand-in for Chrome's DevTools endpoint: HTTP /json/* plus a browser websocket that records
+    every message it receives and answers createTarget with a target id and anything else with {}."""
+
+    def __init__(self):
+        import socket as _s
+        import threading as _t
+        self.received, self.http, self.handshakes = [], [], []
+        self.srv = _s.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(16)
+        self.port = self.srv.getsockname()[1]
+        _t.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self):
+        import threading as _t
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            _t.Thread(target=self._conn, args=(c,), daemon=True).start()
+
+    def _conn(self, c):
+        import hashlib
+        r = hca._Reader(c)
+        head = r.read_head()
+        if head is None:
+            return
+        lines = head.decode().split("\r\n")
+        method, target = lines[0].split(" ")[:2]
+        hdr = {k.strip().lower(): v.strip() for k, v in (l.split(":", 1) for l in lines[1:] if ":" in l)}
+        if hdr.get("upgrade", "").lower() == "websocket":
+            self.handshakes.append(hdr)
+            acc = base64.b64encode(hashlib.sha1((hdr["sec-websocket-key"] + hca.WS_GUID).encode()).digest())
+            c.sendall(b"HTTP/1.1 101 WebSocket Protocol Handshake\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                      b"Sec-WebSocket-Accept: " + acc + b"\r\n\r\n")
+            while True:
+                try:
+                    raw, fin, op, data = hca.read_frame(r)
+                except Exception:
+                    return
+                if op == 8:
+                    return
+                m = json.loads(data)
+                self.received.append(m)
+                res = {"targetId": "T-NEW"} if m.get("method") == "Target.createTarget" else {}
+                if m.get("method") == "Echo.big":
+                    res = {"blob": "y" * 300000}
+                out = {"id": m["id"], "result": res}
+                if "sessionId" in m:
+                    out["sessionId"] = m["sessionId"]
+                c.sendall(hca.encode_frame(1, json.dumps(out).encode(), mask=False))
+        self.http.append((method, target, hdr.get("host")))
+        host = hdr.get("host", "")
+        if target.startswith("/json/version"):
+            body = json.dumps({"Browser": "Fake/1", "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/browser/B"
+                               % self.port})
+        elif target.startswith("/json/list") or target == "/json":
+            body = json.dumps([{"id": "T-NEW", "type": "page", "url": "about:blank",
+                                "webSocketDebuggerUrl": "ws://%s/devtools/page/T-NEW" % host}])
+        elif target.startswith("/json/activate/"):
+            body = "Target activated"
+        else:
+            body = "unknown"
+        b = body.encode()
+        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(b), b))
+        c.close()
+
+    def close(self):
+        self.srv.close()
+
+
+import base64  # noqa: E402  (FakeChrome handshake)
+import json    # noqa: E402
+import urllib.request  # noqa: E402
+
+
+class FocusFilterProxy(unittest.TestCase):
+    """End to end over loopback: client -> CDPProxy -> FakeChrome."""
+
+    def setUp(self):
+        import tempfile
+        self.chrome = FakeChrome()
+        self.addCleanup(self.chrome.close)
+        self.show = False
+        self.logs = []
+        p = mock.patch.object(hca, "peer_desc", return_value="pid 777 (testclient)")
+        p.start()
+        self.addCleanup(p.stop)
+        self.proxy = hca.CDPProxy(0, self.chrome.port, show=lambda: self.show, logf=self.logs.append)
+        self.proxy.start()
+        self.addCleanup(self.proxy.close)
+        self.port = self.proxy.port
+        self.tmp = tempfile.mkdtemp()
+
+    def get(self, path, method="GET"):
+        req = urllib.request.Request("http://127.0.0.1:%d%s" % (self.port, path), method=method)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, r.read().decode()
+
+    def ws(self):
+        st, body = self.get("/json/version")
+        url = json.loads(body)["webSocketDebuggerUrl"]
+        self.assertIn(":%d/" % self.port, url, "version must point clients back at the proxy")
+        c = hca.CDP(url)
+        self.addCleanup(c.close)
+        return c
+
+    def methods(self):
+        return [m["method"] for m in self.chrome.received]
+
+    def test_ws_create_target_rewritten_and_logged(self):
+        c = self.ws()
+        self.assertEqual(c.call("Target.createTarget", {"url": "about:blank"}), {"targetId": "T-NEW"})
+        self.assertEqual(self.chrome.received[-1]["params"], {"url": "about:blank", "background": True,
+                                                              "newWindow": True})
+        self.assertIn("focus-filter: Target.createTarget from pid 777 (testclient) rewritten", self.logs)
+
+    def test_ws_background_create_target_gets_window_without_log(self):
+        c = self.ws()
+        c.call("Target.createTarget", {"url": "about:blank", "background": True})
+        self.assertEqual(self.chrome.received[-1]["params"], {"url": "about:blank", "background": True,
+                                                              "newWindow": True})
+        self.assertEqual([l for l in self.logs if l.startswith("focus-filter")], [])
+
+    def test_ws_activate_and_bring_to_front_never_reach_chrome(self):
+        c = self.ws()
+        self.assertEqual(c.call("Target.activateTarget", {"targetId": "T"}), {})
+        self.assertEqual(c.call("Page.bringToFront", {}, session="S1"), {})
+        self.assertEqual(c.call("Runtime.evaluate", {"expression": "1"}, session="S1"), {})
+        self.assertEqual(self.methods(), ["Runtime.evaluate"])
+        self.assertIn("focus-filter: Page.bringToFront from pid 777 (testclient) rewritten", self.logs)
+
+    def test_ws_show_flag_passes_raising_calls_through(self):
+        self.show = True
+        c = self.ws()
+        c.call("Target.createTarget", {"url": "about:blank"})
+        c.call("Target.activateTarget", {"targetId": "T"})
+        self.assertEqual(self.methods(), ["Target.createTarget", "Target.activateTarget"])
+        self.assertEqual(self.chrome.received[0]["params"], {"url": "about:blank"})
+        self.assertEqual([l for l in self.logs if l.startswith("focus-filter")], [])
+
+    def test_ws_large_messages_pass_both_ways(self):
+        c = self.ws()
+        big = "x" * 200000
+        c.call("Runtime.evaluate", {"expression": big})
+        self.assertEqual(self.chrome.received[-1]["params"]["expression"], big)
+        self.assertEqual(len(c.call("Echo.big")["blob"]), 300000)
+
+    def test_ws_compression_extension_not_negotiated(self):
+        # A compressed (permessage-deflate) stream could not be inspected: the proxy drops the offer.
+        import socket as _s
+        s = _s.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"GET /devtools/browser/B HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\n"
+                  b"Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"  # RFC 6455 sample nonce  gitleaks:allow
+                  b"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
+        self.assertIn(b" 101 ", s.recv(4096))
+        s.close()
+        self.assertNotIn("sec-websocket-extensions", self.chrome.handshakes[-1])
+
+    def test_http_activate_answered_without_chrome(self):
+        self.assertEqual(self.get("/json/activate/T-1"), (200, "Target activated"))
+        self.assertFalse([h for h in self.chrome.http if h[1].startswith("/json/activate")])
+        self.assertIn("focus-filter: /json/activate from pid 777 (testclient) rewritten", self.logs)
+
+    def test_http_activate_forwarded_under_show(self):
+        self.show = True
+        self.assertEqual(self.get("/json/activate/T-1"), (200, "Target activated"))
+        self.assertTrue([h for h in self.chrome.http if h[1] == "/json/activate/T-1"])
+
+    def test_http_put_new_becomes_background_create_target(self):
+        st, body = self.get("/json/new?https://example.com/", method="PUT")
+        self.assertEqual(st, 200)
+        t = json.loads(body)
+        self.assertEqual(t["id"], "T-NEW")
+        self.assertIn(":%d/" % self.port, t["webSocketDebuggerUrl"])
+        ct = [m for m in self.chrome.received if m["method"] == "Target.createTarget"]
+        self.assertEqual(ct[-1]["params"], {"url": "https://example.com/", "background": True, "newWindow": True})
+        self.assertFalse([h for h in self.chrome.http if h[1].startswith("/json/new")])
+        self.assertIn("focus-filter: /json/new from pid 777 (testclient) rewritten", self.logs)
+
+    def test_http_other_paths_forwarded(self):
+        st, body = self.get("/json/list")
+        self.assertEqual(json.loads(body)[0]["id"], "T-NEW")
+        self.assertIn(":%d/" % self.port, json.loads(body)[0]["webSocketDebuggerUrl"])
+
+
 if __name__ == "__main__":
     unittest.main()

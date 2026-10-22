@@ -61,11 +61,21 @@ Hermes). Target: any Mac with Screen Sharing (Apple auth types 30 and 33; classi
 - The target Mac shows macOS's "Your screen is being controlled" indicator while a tool call is connected,
   and anyone at that Mac sees the pointer move.
 
+## Local Screen Sharing guard
+
+`screen_guard.py` (hooks `pre_tool_call` + `pre_llm_call`, registered even when the tools are not) refuses terminal /
+execute_code (also inside `tool_call`) commands that open Screen Sharing on this Mac: `open ... vnc://`,
+`open -a "Screen Sharing"`, `open -b com.apple.ScreenSharing`, `osascript ... Screen Sharing`. A control-mode window
+steals key focus, hides the cursor and captures Cmd-Tab. The error points to `remote_screenshot` / `remote_input` /
+`remote_approve_dialog` or a `::screenshare{host=...}` button. Allowed only when the current user turn of an
+interactive chat explicitly asks ("open Screen Sharing to ..."); Kanban workers, cron and delegated subagents are
+always refused. Off switch: `HERMES_SCREEN_SHARE_GUARD=0`. Tests: `tests_screen_guard.py`.
+
 ## Tests
 
 ```sh
 cd plugins/remote-screen
-uv run --with pytest --with cryptography --with pillow python -m pytest -q -p no:cacheprovider tests_remote_screen.py
+uv run --with pytest --with cryptography --with pillow python -m pytest -q -p no:cacheprovider tests_remote_screen.py tests_screen_guard.py
 ```
 
 An in-process fake Apple VNC server covers type-30 login (DH + AES credential blocks), bad-password errors,

@@ -1,5 +1,11 @@
 # open-asks
 
+> **Retired: replaced by [user-steps](../user-steps/).** user-steps finds asks with a model instead of a regex
+> (this plugin's regex is its fallback), frames them in Desktop replies with one-click buttons, lists them in a
+> "For you" strip above the composer, and keeps ONE rolling blocked card per chat instead of one per ask.
+> `install.sh` skips this plugin (`retired:` in `plugin.yaml`); disable it where it is enabled:
+> `hermes plugins disable open-asks`. The code stays for reference.
+
 Every question a chat reply leaves for the user becomes a blocked Kanban card linked to that chat.
 
 ## Why (five whys)
@@ -29,7 +35,7 @@ behind later completion notices until the user asked why the session wasn't mark
 
 Skipped: Kanban workers (`HERMES_KANBAN_TASK`), subagents, cron/webhook platforms, asks that name a card already
 `blocked`, hypotheticals ("if you ever want…", "no action needed"), code blocks and quotes. At most 4 cards per
-chat per hour. Off switch: `HERMES_OPEN_ASKS_OFF=1`.
+chat per hour. If the `ask-gate` plugin held or could not verify the ask (`cache/ask-gate/verdicts.json`, under 5 minutes old), no card is filed: a card would publish the unverified premise. Off switch: `HERMES_OPEN_ASKS_OFF=1`.
 
 The card is created through the agent's own `kanban_create` tool in-process, which links it to the chat. If that
 tool isn't loaded, it falls back to `hermes kanban create` + `notify-subscribe --platform tui`.

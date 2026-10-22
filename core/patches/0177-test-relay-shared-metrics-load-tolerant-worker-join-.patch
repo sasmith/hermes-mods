@@ -1,0 +1,54 @@
+From e23107dcf59b165b0601626524cab6fe77af37b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 06:48:21 +0000
+Subject: [PATCH] test(relay shared metrics): load-tolerant worker join and
+ parked-flush timeouts (#15)
+
+---
+ .../hermes_cli/test_relay_shared_metrics_runtime.py  | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/tests/hermes_cli/test_relay_shared_metrics_runtime.py b/tests/hermes_cli/test_relay_shared_metrics_runtime.py
+index 397ecaf0c6..4641a5dc55 100644
+--- a/tests/hermes_cli/test_relay_shared_metrics_runtime.py
++++ b/tests/hermes_cli/test_relay_shared_metrics_runtime.py
+@@ -218,11 +218,17 @@ class _Relay:
+ _EXPORT_WORKER = "hermes-shared-metrics-flush"
+ 
+ 
++# Generous bounds: CI runners can be heavily loaded (load ~77). They only cap a
++# hang; tests release/join explicitly, so healthy runs return immediately.
++_WORKER_JOIN_TIMEOUT_S = 120
++_PARK_TIMEOUT_S = 120
++
++
+ def _join_export_workers() -> None:
+     """Task/session exports run on a background worker; wait for it before reading the store."""
+     while workers := [t for t in threading.enumerate() if t.name == _EXPORT_WORKER]:
+         for worker in workers:
+-            worker.join(timeout=10)
++            worker.join(timeout=_WORKER_JOIN_TIMEOUT_S)
+             assert not worker.is_alive()
+ 
+ 
+@@ -2539,7 +2545,7 @@ def parked_flush(direct_runtime, monkeypatch):
+     def parked() -> None:
+         state.attempts += 1
+         state.entered.set()
+-        state.release.wait(3)
++        state.release.wait(_PARK_TIMEOUT_S)
+ 
+     direct_runtime.subscribers.flush = parked
+     yield state
+@@ -2551,7 +2557,7 @@ def test_task_ends_do_not_wait_on_the_process_wide_flush_barrier(parked_flush, t
+     _finish_desktop_task("s1", "t1")
+ 
+     # The turn thread is back while the barrier is still parked, so nothing is exported yet.
+-    assert parked_flush.entered.wait(3)
++    assert parked_flush.entered.wait(_PARK_TIMEOUT_S)
+     outbox = tmp_path / "hermes-home" / "telemetry" / "shared_metrics" / "outbox"
+     assert list(outbox.glob("*.json")) == []
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -21,7 +21,9 @@ _spec.loader.exec_module(ut)
 
 
 def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
-    """Run runner.sh in a pty, typing each answer once its prompt shows up."""
+    """Run runner.sh in a pty, typing each answer once its prompt shows up. With a confirm file the first
+    answer goes to ``Run it?``; without one every answer goes to ``Press Enter``."""
+    asks = (job / "confirm").exists()
     pid, fd = pty.fork()
     if pid == 0:
         os.environ["SHELL"] = "/bin/bash"
@@ -37,15 +39,49 @@ def _drive(job: Path, answers: list[str], timeout: float = 20) -> bytes:
             if not chunk:
                 break
             buf += chunk
-        if pending and (b"Run it?" in buf if len(pending) == len(answers) else b"Press Enter" in buf):
+        if pending and (b"Run it?" in buf if asks and len(pending) == len(answers) else b"Press Enter" in buf):
             os.write(fd, pending.pop(0).encode())
     os.waitpid(pid, 0)
     return buf
 
 
+@pytest.fixture(autouse=True)
+def _confirm_env(monkeypatch):
+    monkeypatch.delenv("HERMES_USER_TERMINAL_CONFIRM", raising=False)
+
+
+def test_default_runs_without_asking(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "off")
+    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path))
+    assert not (job / "confirm").exists()
+    screen = _drive(job, ["\n"])
+    assert b"Run it?" not in screen and b"Ctrl-C cancels" in screen
+    res = ut.wait_for(job, 1)
+    assert res["status"] == "ran" and res["exit_code"] == 3
+    assert "hello-from-job" in res["output"]
+
+
+@pytest.mark.parametrize("env,mode", [("", "off"), ("off", "off"), ("remote", "remote"), ("all", "all"),
+                                      ("1", "all"), ("bogus", "off")])
+def test_confirm_mode_env(monkeypatch, env, mode):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_CONFIRM", env)
+    monkeypatch.setitem(sys.modules, "hermes_cli", None)  # no config -> env only
+    assert ut.confirm_mode() == mode
+
+
+@pytest.mark.parametrize("mode,origin,asks", [("off", None, False), ("off", {"gateway": "g"}, False),
+                                              ("remote", None, False), ("remote", {"gateway": "g"}, True),
+                                              ("all", None, True)])
+def test_confirm_file_follows_mode(tmp_path, monkeypatch, mode, origin, asks):
+    monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
+    monkeypatch.setattr(ut, "confirm_mode", lambda: mode)
+    assert (ut.create_job("true", "", str(tmp_path), origin) / "confirm").exists() is asks
+
+
 def test_confirm_runs_and_captures(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
-    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path))
+    job = ut.create_job("echo hello-from-job; exit 3", "testing", str(tmp_path), confirm=True)
     _drive(job, ["y\n", "\n"])
     res = ut.wait_for(job, 1)
     assert res["status"] == "ran" and res["exit_code"] == 3
@@ -54,7 +90,7 @@ def test_confirm_runs_and_captures(tmp_path, monkeypatch):
 
 def test_decline(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_USER_TERMINAL_DIR", str(tmp_path))
-    job = ut.create_job("touch SHOULD_NOT_EXIST", "", str(tmp_path))
+    job = ut.create_job("touch SHOULD_NOT_EXIST", "", str(tmp_path), confirm=True)
     _drive(job, ["n\n"])
     res = ut.wait_for(job, 1)
     assert res["status"] == "declined"
@@ -130,10 +166,11 @@ def _outbox(base: Path) -> list:
     return list((base / "outbox").glob("*.json")) if (base / "outbox").is_dir() else []
 
 
-# Invariant 1: nothing runs without the owner typing y in the Mac window.
+# Invariant 1 (confirm=remote|all): nothing relayed runs without the owner typing y in the Mac window.
 @pytest.mark.parametrize("answer", ["\n", "n\n", "no\n"])
 def test_relayed_job_runs_only_after_y(remote, monkeypatch, tmp_path, answer):
     monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "remote")
     marker = tmp_path / "RAN"
     res = ut.start_relayed(f"touch {marker}", "why", str(tmp_path), ORIGIN)
     assert res["ok"] and res["status"] == "waiting_for_user"
@@ -182,9 +219,30 @@ def test_owner_gate_reads_session_row_source(remote, monkeypatch):
     assert ut.owner_refusal("s-slack") and ut.owner_refusal("s-desk") is None
 
 
+def test_owner_dm_refusal_routes_to_ops_not_paste_it(remote, monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", types.SimpleNamespace(
+        load_config=lambda: {"owner": {"slack_user_ids": ["U0OWNER"]}}))
+    base = {"HERMES_SESSION_PLATFORM": "slack", "HERMES_SESSION_CHAT_TYPE": "dm", "HERMES_SESSION_CHAT_ID": "D1",
+            "HERMES_SESSION_USER_ID": "U0OWNER"}
+    for k, v in base.items():
+        monkeypatch.setenv(k, v)
+    out = json.loads(ut.handle_remote({"command": "echo ok", "wait_s": 1}))
+    assert out["ok"] is False and "mac_ops_handoff" in out["error"] and "Never hand over commands" in out["error"]
+    assert not _outbox(remote[0])  # still refused: nothing sent toward the Mac
+    # a channel, or someone else's DM, keeps the old text (no handoff offer)
+    for over in ({"HERMES_SESSION_CHAT_TYPE": "channel", "HERMES_SESSION_CHAT_ID": "C1"},
+                 {"HERMES_SESSION_USER_ID": "U0STRANGER"}):
+        for k, v in {**base, **over}.items():
+            monkeypatch.setenv(k, v)
+        out = json.loads(ut.handle_remote({"command": "echo ok", "wait_s": 1}))
+        assert "mac_ops_handoff" not in out["error"] and "refused" in out["error"]
+
+
 # Invariant 3: the window names the originating gateway, profile and session; control chars can't hide text.
 def test_window_shows_origin_and_neutralises_escapes(remote, monkeypatch, tmp_path):
     monkeypatch.setattr(ut, "open_window", lambda job: "fake")
+    monkeypatch.setattr(ut, "confirm_mode", lambda: "all")  # decline so the escape-laden command never runs
     res = ut.start_relayed("echo visible\x1b[2K\rhidden", "reason\x1b]0;x\x07", str(tmp_path),
                            {**ORIGIN, "title": "evil\x1b[31m"})
     job = ut.jobs_dir() / res["job_id"]
@@ -280,8 +338,8 @@ def test_round_trip_remote_to_mac_and_back(remote, monkeypatch, tmp_path):
     monkeypatch.setattr(ut, "POLL_S", 1)
     screens = []
 
-    def fake_window(job):  # the owner reads the window and types y
-        threading.Thread(target=lambda: screens.append(_drive(job, ["y\n", "\n"])), daemon=True).start()
+    def fake_window(job):  # default confirm=off: it runs at once, the owner only closes the window
+        threading.Thread(target=lambda: screens.append(_drive(job, ["\n"])), daemon=True).start()
         return "fake"
 
     monkeypatch.setattr(ut, "open_window", fake_window)
@@ -362,3 +420,39 @@ def test_dashboard_routes_start_and_status(remote, monkeypatch, tmp_path):
     assert st["status"] == "pending"
     assert c.get(f"/api/plugins/user-terminal/status/{r['job_id']}?gateway=other").json()["ok"] is False
     assert c.post("/api/plugins/user-terminal/start", json={"command": "x"}).json()["ok"] is False  # no origin
+
+
+@pytest.mark.parametrize("out", [
+    "daveey@desk.local: Permission denied (publickey,password,keyboard-interactive).",
+    "Permission denied (publickey,keyboard-interactive).",
+    # nested: laptop -> hop -> host, the inner ssh's failure arrives on its own line
+    "Warning: Permanently added 'desk.local' (ED25519) to the list of known hosts.\r\n"
+    "you@desk.local: Permission denied (publickey,password,keyboard-interactive).\nexit 255",
+    "Enter passphrase for key '/Users/you/.ssh/id_ed25519':",
+    "you@desk.local's password: ",
+    "/usr/bin/ssh-copy-id: ERROR: Permission denied (publickey).",
+])
+def test_ssh_password_auth_gets_ssh_copy_id_hint(out):
+    new = ut.transform_terminal_output(command="ssh -o BatchMode=yes desk.local true", output=out)
+    assert new and "run_in_user_terminal" in new and "ssh-copy-id -i ~/.ssh/id_ed25519.pub" in new
+    assert "hand it back" in new
+    assert ut.transform_terminal_output(command="ssh x", output=new) is None  # idempotent
+
+
+@pytest.mark.parametrize("out", [
+    "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+    "security: SecKeychainUnlock: User interaction is not allowed.",
+])
+def test_git_https_and_keychain_get_hint(out):
+    new = ut.transform_terminal_output(command="git pull", output=out)
+    assert new and "run_in_user_terminal" in new and "ssh-copy-id" not in new
+
+
+@pytest.mark.parametrize("out", [
+    "Permission denied (publickey).",                         # key-only server: a password can't help
+    "73 sudo: a password is required",                        # a log/grep that mentions it, not sudo itself
+    "grep: Permission denied (publickey,password) appears in auth.log",
+    "ok",
+])
+def test_no_hint_for_mentions_or_key_only_servers(out):
+    assert ut.transform_terminal_output(command="x", output=out) is None

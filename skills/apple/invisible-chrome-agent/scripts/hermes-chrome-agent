@@ -13,7 +13,9 @@ Subcommands:
 
 Stdlib only (runs under /usr/bin/python3). Configuration via environment:
   HERMES_HOME                    default ~/.hermes
-  HERMES_CHROME_AGENT_PORT       CDP port (default 9333, loopback only)
+  HERMES_CHROME_AGENT_PORT       CDP port clients use (default 9333, loopback only; served by the focus-filter proxy)
+  HERMES_CHROME_AGENT_CHROME_PORT  Chrome's own CDP port behind the proxy (default PORT+1 = 9334, loopback only)
+  HERMES_CHROME_AGENT_FOCUS_FILTER=0     no proxy: Chrome listens on PORT directly and raising calls go through
   HERMES_CHROME_AGENT_PROFILE    Chrome --user-data-dir (default $HERMES_HOME/chrome-agent)
   HERMES_CHROME_AGENT_TOOLS      dir holding the hermes-vdisplay binary (default $HERMES_HOME/chrome-agent-tools)
   HERMES_CHROME_AGENT_CHROME     Chrome binary (default /Applications/Google Chrome.app/Contents/MacOS/Google Chrome)
@@ -21,7 +23,15 @@ Stdlib only (runs under /usr/bin/python3). Configuration via environment:
   HERMES_CHROME_AGENT_SHOW_ON_PASSKEY=1  bring the passkey-requesting window to the main display until it settles
   HERMES_CHROME_AGENT_FOCUS_GUARD=0      let the agent Chrome take keyboard focus whenever a CDP client asks
 
-Focus guard: a CDP client that opens a foreground tab (Target.createTarget without background=true),
+Focus filter: Chrome listens on CHROME_PORT and the supervisor serves PORT as a transparent CDP proxy
+(HTTP /json/* and every websocket). Unless the show flag is set (`show`, browser_focus), it rewrites the calls
+that make macOS raise Chrome: Target.createTarget gets background:true (and loses focus:true),
+Target.activateTarget and Page.bringToFront are answered {} without reaching Chrome, GET /json/activate/<id>
+is answered "Target activated", and PUT /json/new?url becomes a background Target.createTarget. Each rewrite is
+logged as `focus-filter: <method> from pid N (command) rewritten`. The supervisor's own CDP connection (passkey
+reveal) talks to CHROME_PORT directly.
+
+Focus guard (backstop): a CDP client that opens a foreground tab (Target.createTarget without background=true),
 activates a target or calls Page.bringToFront makes macOS hand the agent Chrome keyboard focus, even while its
 windows sit on the virtual display. The supervisor polls the frontmost app every 0.25s and gives focus back
 to the app the user had in front, unless the activation was asked for: `show` ran in the last 10s
@@ -46,11 +56,16 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 HOME = os.path.expanduser("~")
 HERMES_HOME = os.environ.get("HERMES_HOME") or os.path.join(HOME, ".hermes")
 PORT = int(os.environ.get("HERMES_CHROME_AGENT_PORT") or 9333)
+# Focus filter: Chrome itself listens on CHROME_PORT and the supervisor proxies PORT -> CHROME_PORT, rewriting
+# CDP calls that would raise Chrome. HERMES_CHROME_AGENT_FOCUS_FILTER=0 puts Chrome straight on PORT again.
+FOCUS_FILTER = os.environ.get("HERMES_CHROME_AGENT_FOCUS_FILTER", "1") not in ("", "0", "false")
+CHROME_PORT = (int(os.environ.get("HERMES_CHROME_AGENT_CHROME_PORT") or PORT + 1)) if FOCUS_FILTER else PORT
 PROFILE = os.environ.get("HERMES_CHROME_AGENT_PROFILE") or os.path.join(HERMES_HOME, "chrome-agent")
 TOOLS = os.environ.get("HERMES_CHROME_AGENT_TOOLS") or os.path.join(HERMES_HOME, "chrome-agent-tools")
 CHROME = os.environ.get("HERMES_CHROME_AGENT_CHROME") or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -261,12 +276,433 @@ class CDP:
             pass
 
 
-def cdp_version(timeout=1.0):
+def cdp_version(timeout=1.0, port=None):
+    """/json/version of Chrome itself (internal port) unless `port` names another endpoint."""
     try:
-        with urllib.request.urlopen("http://127.0.0.1:%d/json/version" % PORT, timeout=timeout) as r:
+        with urllib.request.urlopen("http://127.0.0.1:%d/json/version" % (port or CHROME_PORT), timeout=timeout) as r:
             return json.load(r)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------- CDP focus filter (proxy on PORT -> CHROME_PORT)
+#
+# Any local process can talk CDP to the shared agent Chrome, and three CDP calls make macOS hand that Chrome
+# keyboard focus: a foreground Target.createTarget, Target.activateTarget and Page.bringToFront (plus their
+# HTTP twins /json/activate/<id> and PUT /json/new). The focus guard can only hand focus back after the steal.
+# So Chrome listens on an internal port and the supervisor serves the public port as a transparent proxy that
+# rewrites those calls unless the show flag is set (`hermes-chrome-agent show`, browser_focus).
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_RAISING = (b"createTarget", b"activateTarget", b"bringToFront")
+_SWALLOWED = ("Target.activateTarget", "Page.bringToFront")
+
+
+def show_active():
+    """The user asked to see the agent Chrome: raising calls pass through untouched."""
+    return os.path.exists(SHOW_FLAG) and not show_expired()
+
+
+def filter_cdp_message(m, show):
+    """Focus-filter rule for one client->Chrome CDP message.
+    None = forward unchanged; ("forward", msg) = forward the rewritten msg (a raise was neutralised, logged);
+    ("window", msg) = forward the rewritten msg (own window only, not logged); ("reply", msg) = answer the client.
+
+    Target.createTarget always ends up background. Unless the show flag is set it also gets its own window
+    (newWindow: true): Chrome stalls Page.enable / Runtime.enable on a background tab inside an existing window
+    (the tab is never visible), while a background tab alone in its own window loads and does not raise Chrome."""
+    if show or not isinstance(m, dict):
+        return None
+    method = m.get("method")
+    if method == "Target.createTarget":
+        p0 = m.get("params") if isinstance(m.get("params"), dict) else {}
+        p = dict(p0, background=True)
+        p.pop("focus", None)
+        if not (p.get("hidden") or p.get("forTab")):
+            p["newWindow"] = True
+        if p == p0:
+            return None
+        raised = p0.get("background") is not True or bool(p0.get("focus"))
+        return ("forward" if raised else "window"), dict(m, params=p)
+    if method in _SWALLOWED and "id" in m:
+        r = {"id": m["id"], "result": {}}
+        if "sessionId" in m:
+            r["sessionId"] = m["sessionId"]
+        return "reply", r
+    return None
+
+
+def filter_http(method, target, show):
+    """Focus-filter rule for one HTTP request: None = forward; ("activate", id); ("new", url)."""
+    if show:
+        return None
+    path, _, query = target.partition("?")
+    if path.startswith("/json/activate/"):
+        return "activate", path[len("/json/activate/"):]
+    if path == "/json/new" and method.upper() == "PUT":
+        return "new", urllib.parse.unquote(query)
+    return None
+
+
+def peer_desc(peer_port):
+    """`pid N (command)` of the local process on the client end of a loopback connection (lsof)."""
+    try:
+        out = subprocess.run(["/usr/sbin/lsof", "-nP", "-Fpn", "-iTCP@127.0.0.1:%d" % peer_port],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                             timeout=3).stdout
+        pids, cur = [], None
+        for l in out.splitlines():           # p<pid> then n<local>-><remote> per socket; the client owns local
+            if l.startswith("p"):
+                cur = int(l[1:])
+            elif l.startswith("n") and l[1:].split("->")[0].endswith(":%d" % peer_port) and cur not in pids:
+                pids.append(cur)
+        if not pids:
+            return "port %d (pid unknown)" % peer_port
+        pid = pids[0]
+        ps = lambda field: subprocess.run(["/bin/ps", "-o", field + "=", "-p", str(pid)], stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL, universal_newlines=True, timeout=3).stdout.strip()
+        exe, args, ppid = ps("comm"), ps("args"), ps("ppid")
+        if exe and args.startswith(exe):      # long interpreter paths would eat the whole budget
+            args = os.path.basename(exe) + args[len(exe):]
+        return "pid %d (%s; ppid %s)" % (pid, args[:160], ppid or "?")
+    except Exception as e:
+        return "port %d (lsof failed: %s)" % (peer_port, e)
+
+
+class _Reader:
+    """Buffered exact reads from a socket."""
+
+    def __init__(self, sock, buf=b""):
+        self.sock, self.buf = sock, buf
+
+    def read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(65536, n - len(self.buf)))
+            if not chunk:
+                raise EOFError("connection closed")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def read_head(self, limit=65536):
+        """Bytes up to and excluding the blank line ending an HTTP head; None if closed first."""
+        while b"\r\n\r\n" not in self.buf:
+            if len(self.buf) > limit:
+                return None
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                return None
+            self.buf += chunk
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        return head
+
+
+def _xor(data, mask):
+    if not data:
+        return data
+    n = len(data)
+    key = (mask * (n // 4 + 1))[:n]
+    return (int.from_bytes(data, "big") ^ int.from_bytes(key, "big")).to_bytes(n, "big")
+
+
+def read_frame(r):
+    """(raw frame bytes, fin, opcode, unmasked payload) from a _Reader."""
+    h = r.read(2)
+    b1, b2 = h[0], h[1]
+    raw = h
+    ln = b2 & 0x7F
+    if ln == 126:
+        x = r.read(2)
+        raw += x
+        ln = struct.unpack(">H", x)[0]
+    elif ln == 127:
+        x = r.read(8)
+        raw += x
+        ln = struct.unpack(">Q", x)[0]
+    mask = None
+    if b2 & 0x80:
+        mask = r.read(4)
+        raw += mask
+    data = r.read(ln)
+    raw += data
+    return raw, bool(b1 & 0x80), b1 & 0x0F, _xor(data, mask) if mask else data
+
+
+def encode_frame(op, payload, mask):
+    hdr = bytes([0x80 | op])
+    n = len(payload)
+    mbit = 0x80 if mask else 0
+    if n < 126:
+        hdr += bytes([mbit | n])
+    elif n < 65536:
+        hdr += bytes([mbit | 126]) + struct.pack(">H", n)
+    else:
+        hdr += bytes([mbit | 127]) + struct.pack(">Q", n)
+    if not mask:
+        return hdr + payload
+    k = os.urandom(4)
+    return hdr + k + _xor(payload, k)
+
+
+class CDPProxy:
+    """Transparent CDP proxy 127.0.0.1:port -> 127.0.0.1:upstream (HTTP /json/* and websockets) that applies
+    the focus filter. port=0 binds an ephemeral port (tests); the bound port is in .port."""
+
+    def __init__(self, port, upstream, show=show_active, logf=None):
+        self.want_port, self.upstream = port, upstream
+        self.port = port
+        self.show = show
+        self.logf = logf or log
+        self.srv = None
+        self.closed = False
+        self.peers = {}   # client port -> `pid N (cmd)` while that connection is open
+
+    # -- lifecycle
+    def start(self, wait=True):
+        """Bind (retrying while a previous Chrome/supervisor still holds the port) and serve in threads."""
+        def bind_loop():
+            logged = False
+            while not self.closed:
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    s.bind(("127.0.0.1", self.want_port))
+                    s.listen(128)
+                    self.srv, self.port = s, s.getsockname()[1]
+                    self.logf("cdp-proxy: 127.0.0.1:%d -> Chrome 127.0.0.1:%d (focus filter on)"
+                              % (self.port, self.upstream))
+                    break
+                except OSError as e:
+                    s.close()
+                    if not logged:
+                        logged = True
+                        self.logf("cdp-proxy: cannot bind 127.0.0.1:%d yet (%s); retrying" % (self.want_port, e))
+                    time.sleep(1)
+            if self.srv:
+                self._accept_loop()
+        t = threading.Thread(target=bind_loop, daemon=True)
+        t.start()
+        deadline = time.time() + 5
+        while wait and self.srv is None and time.time() < deadline:
+            time.sleep(0.01)
+        return self
+
+    def close(self):
+        self.closed = True
+        if self.srv:
+            try:
+                self.srv.close()
+            except OSError:
+                pass
+
+    def _accept_loop(self):
+        while not self.closed:
+            try:
+                c, addr = self.srv.accept()
+            except OSError:
+                if self.closed:
+                    return
+                time.sleep(0.1)
+                continue
+            threading.Thread(target=self._serve, args=(c, addr), daemon=True).start()
+
+    def _rewrite(self, peer_port, what):
+        who = self.peers.get(peer_port)
+        if who is None:
+            if len(self.peers) > 256:
+                self.peers.clear()
+            who = self.peers[peer_port] = peer_desc(peer_port)
+        self.logf("focus-filter: %s from %s rewritten" % (what, who))
+
+    def _fix_ports(self, body):
+        for h in (b"127.0.0.1", b"localhost"):
+            body = body.replace(h + b":%d" % self.upstream, h + b":%d" % self.port)
+        return body
+
+    # -- one client connection
+    def _serve(self, c, addr):
+        try:
+            r = _Reader(c)
+            head = r.read_head()
+            if head is None:
+                return
+            lines = head.decode("latin-1").split("\r\n")
+            parts = lines[0].split(" ")
+            if len(parts) < 3:
+                return
+            method, target = parts[0], parts[1]
+            headers = [tuple(x.strip() for x in l.split(":", 1)) for l in lines[1:] if ":" in l]
+            hmap = {k.lower(): v for k, v in headers}
+            if hmap.get("upgrade", "").lower() == "websocket":
+                self._ws(c, r, lines[0], headers, addr)
+            else:
+                body = r.read(int(hmap.get("content-length") or 0))
+                self._http(c, method, target, headers, body, addr)
+        except Exception as e:
+            if not self.closed:
+                self.logf("cdp-proxy: connection from port %d: %s" % (addr[1], e))
+        finally:
+            self.peers.pop(addr[1], None)
+            try:
+                c.close()
+            except OSError:
+                pass
+
+    @staticmethod
+    def _respond(c, status, reason, body, ctype="text/plain"):
+        if isinstance(body, str):
+            body = body.encode()
+        c.sendall(("HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                   % (status, reason, ctype, len(body))).encode() + body)
+
+    def _http(self, c, method, target, headers, body, addr):
+        import http.client
+        rule = filter_http(method, target, self.show())
+        if rule and rule[0] == "activate":
+            self._rewrite(addr[1], "/json/activate")
+            self._respond(c, 200, "OK", "Target activated")
+            return
+        if rule and rule[0] == "new":
+            self._rewrite(addr[1], "/json/new")
+            self._respond(c, 200, "OK", json.dumps(self._new_background(rule[1]), indent=3), "application/json")
+            return
+        up = http.client.HTTPConnection("127.0.0.1", self.upstream, timeout=30)
+        try:
+            hdrs = {k: v for k, v in headers if k.lower() not in ("connection", "keep-alive", "content-length")}
+            up.request(method, target, body=body or None, headers=hdrs)
+            resp = up.getresponse()
+            data = self._fix_ports(resp.read())
+            out = "HTTP/1.1 %d %s\r\n" % (resp.status, resp.reason)
+            for k, v in resp.getheaders():
+                if k.lower() not in ("content-length", "connection", "transfer-encoding", "keep-alive"):
+                    out += "%s: %s\r\n" % (k, v)
+            out += "Content-Length: %d\r\nConnection: close\r\n\r\n" % len(data)
+            c.sendall(out.encode("latin-1") + data)
+        finally:
+            up.close()
+
+    def _new_background(self, url):
+        """PUT /json/new?url without raising: Target.createTarget background:true, answered like Chrome would."""
+        v = cdp_version(timeout=5, port=self.upstream)
+        if not v:
+            raise CDPError("Chrome not answering on %d" % self.upstream)
+        cdp = CDP(v["webSocketDebuggerUrl"])
+        try:
+            tid = cdp.call("Target.createTarget", {"url": url or "about:blank", "background": True,
+                                                  "newWindow": True})["targetId"]
+        finally:
+            cdp.close()
+        for _ in range(20):
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % self.upstream, timeout=5) as resp:
+                    for t in json.loads(self._fix_ports(resp.read())):
+                        if t.get("id") == tid:
+                            return t
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return {"id": tid, "type": "page", "url": url or "about:blank",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:%d/devtools/page/%s" % (self.port, tid)}
+
+    def _ws(self, c, r, request_line, headers, addr):
+        up = socket.create_connection(("127.0.0.1", self.upstream), timeout=30)
+        try:
+            # Drop compression offers: a permessage-deflate stream could not be inspected.
+            head = request_line + "\r\n" + "".join("%s: %s\r\n" % (k, v) for k, v in headers
+                                                   if k.lower() != "sec-websocket-extensions") + "\r\n"
+            up.sendall(head.encode("latin-1"))
+            ur = _Reader(up)
+            resp = ur.read_head()
+            if resp is None:
+                return
+            c.sendall(resp + b"\r\n\r\n")
+            if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+                c.sendall(ur.buf)   # e.g. Chrome's 403 for a bad Origin, then it closes
+                return
+            up.settimeout(None)
+            c.settimeout(None)
+            to_client = threading.Lock()
+            threading.Thread(target=self._pump_down, args=(ur, c, up, to_client), daemon=True).start()
+            self._pump_up(r, up, c, to_client, addr)
+        finally:
+            try:
+                up.close()
+            except OSError:
+                pass
+
+    def _pump_down(self, ur, c, up, lock):
+        """Chrome -> client, frame by frame so locally answered replies never land inside a fragmented message."""
+        held = False   # the lock stays held from the first to the last frame of a fragmented message
+        try:
+            while True:
+                raw, fin, op, _ = read_frame(ur)
+                if op >= 8 and held:          # control frame between fragments
+                    c.sendall(raw)
+                elif op >= 8:
+                    with lock:
+                        c.sendall(raw)
+                else:
+                    if not held:
+                        lock.acquire()
+                        held = True
+                    c.sendall(raw)
+                    if fin:
+                        lock.release()
+                        held = False
+                if op == 8:
+                    break
+        except Exception:
+            pass
+        finally:
+            if held:
+                lock.release()
+            for s in (c, up):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def _pump_up(self, r, up, c, lock, addr):
+        """Client -> Chrome: inspect each complete message and apply the focus filter."""
+        frames, payload = [], b""
+        try:
+            while True:
+                raw, fin, op, data = read_frame(r)
+                if op >= 8:                    # control frames: pass straight through
+                    up.sendall(raw)
+                    if op == 8:
+                        break
+                    continue
+                frames.append(raw)
+                payload += data
+                if not fin:
+                    continue
+                msg_frames, msg, frames, payload = frames, payload, [], b""
+                act = None
+                if any(k in msg for k in _RAISING):
+                    try:
+                        act = filter_cdp_message(json.loads(msg.decode("utf-8")), self.show())
+                    except ValueError:
+                        act = None
+                if act is None:
+                    up.sendall(b"".join(msg_frames))
+                    continue
+                kind, out = act
+                if kind != "window":
+                    self._rewrite(addr[1], out.get("method") if kind == "forward" else json.loads(msg)["method"])
+                if kind in ("forward", "window"):
+                    up.sendall(encode_frame(1, json.dumps(out).encode(), mask=True))
+                else:
+                    with lock:
+                        c.sendall(encode_frame(1, json.dumps(out).encode(), mask=False))
+        except Exception:
+            pass
+        finally:
+            for s in (c, up):
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------- supervisor
@@ -415,6 +851,7 @@ class Supervisor:
         self.evict_untrusted_logged = False
         self.notices = {}   # targetId -> running notifier Popen (its notification is still on screen)
         self.focus = FocusGuard()
+        self.proxy = None
 
     # -- children
     def start_vdisplay(self):
@@ -495,9 +932,10 @@ class Supervisor:
         self._kill_stale_chrome()
         os.makedirs(PROFILE, exist_ok=True)
         self._prefs_off_savers()
-        args = [CHROME, "--user-data-dir=" + PROFILE, "--remote-debugging-port=%d" % PORT,
+        args = [CHROME, "--user-data-dir=" + PROFILE, "--remote-debugging-port=%d" % CHROME_PORT,
                 "--remote-debugging-address=127.0.0.1",
-                "--remote-allow-origins=http://127.0.0.1:%d,http://localhost:%d" % (PORT, PORT),
+                "--remote-allow-origins=" + ",".join("http://%s:%d" % (h, p) for p in sorted({PORT, CHROME_PORT})
+                                                     for h in ("127.0.0.1", "localhost")),
                 "--no-first-run", "--no-default-browser-check", "--hide-crash-restore-bubble",
                 "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
                 "--disable-background-timer-throttling", "about:blank"]
@@ -795,7 +1233,8 @@ class Supervisor:
             time.sleep(FOCUS_POLL_S)
 
     def write_state(self):
-        st = {"pid": os.getpid(), "port": PORT, "profile": PROFILE, "vdisplay_bounds": self.vbounds,
+        st = {"pid": os.getpid(), "port": PORT, "chrome_port": CHROME_PORT, "focus_filter": FOCUS_FILTER,
+              "profile": PROFILE, "vdisplay_bounds": self.vbounds,
               "main_bounds": self.main, "chrome_pid": self.chrome.pid if self.chrome else None,
               "vdisplay_pid": self.vd.pid if self.vd else None, "show": os.path.exists(SHOW_FLAG),
               "updated": time.time()}
@@ -816,6 +1255,8 @@ class Supervisor:
                 "floating alert instead. Allow them: open '%s'" % (ns, NOTIFIER_SETTINGS_URL))
         self.start_vdisplay()
         self.start_chrome()
+        if FOCUS_FILTER:
+            self.proxy = CDPProxy(PORT, CHROME_PORT).start(wait=False)
         if FOCUS_GUARD:
             threading.Thread(target=self.focus_loop, daemon=True).start()
             log("focus-guard: on")
@@ -879,7 +1320,13 @@ def cmd_status():
     print("focus guard: %s" % ("on (unrequested focus grabs are handed back; see `focus-guard:` log lines)"
                                 if FOCUS_GUARD else "off (HERMES_CHROME_AGENT_FOCUS_GUARD=0)"))
     v = cdp_version()
-    print("cdp: http://127.0.0.1:%d %s" % (PORT, v["Browser"] if v else "NOT answering"))
+    if FOCUS_FILTER:
+        pv = cdp_version(port=PORT)
+        print("focus filter: on (clients use http://127.0.0.1:%d -> proxy %s; Chrome on %d; rewrites logged as "
+              "`focus-filter:`)" % (PORT, "answering" if pv else "NOT answering", CHROME_PORT))
+    else:
+        print("focus filter: off (HERMES_CHROME_AGENT_FOCUS_FILTER=0)")
+    print("cdp: http://127.0.0.1:%d %s" % (CHROME_PORT, v["Browser"] if v else "NOT answering"))
     if v:
         c = CDP(v["webSocketDebuggerUrl"])
         try:
@@ -921,7 +1368,8 @@ def plist_text():
     py = os.environ.get("HERMES_CHROME_AGENT_PYTHON") or "/usr/bin/python3"
     script = os.path.join(TOOLS, "hermes-chrome-agent")
     env = "".join("<key>%s</key><string>%s</string>" % (k, os.environ[k]) for k in
-                  ("HERMES_CHROME_AGENT_PORT", "HERMES_CHROME_AGENT_PROFILE", "HERMES_CHROME_AGENT_CHROME")
+                  ("HERMES_CHROME_AGENT_PORT", "HERMES_CHROME_AGENT_PROFILE", "HERMES_CHROME_AGENT_CHROME",
+                   "HERMES_CHROME_AGENT_CHROME_PORT", "HERMES_CHROME_AGENT_FOCUS_FILTER")
                   if os.environ.get(k))
     return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1042,7 +1490,8 @@ def cmd_uninstall():
 def show_expired(now=None):
     """The show flag may hold an epoch deadline (`show --minutes N`); empty = until `hide`."""
     try:
-        text = open(SHOW_FLAG).read().strip()
+        with open(SHOW_FLAG) as f:
+            text = f.read().strip()
         return bool(text) and float(text) <= (now or time.time())
     except (OSError, ValueError):
         return False

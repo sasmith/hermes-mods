@@ -14,6 +14,9 @@ What you see: a card waiting on a run cap, a soak, a nightly run or a release wi
 `blocked`, so the chat that created it no longer turns red as if it needed you. It wakes by itself at the time it
 named (or after 24h), and a comment or heartbeat landing after the park no longer leaves it asleep forever.
 
+See also [kanban-park-invariants.md](kanban-park-invariants.md) (0169): every `kanban_schedule` park now gets a wake
+(default 24h) and human asks cannot be scheduled.
+
 ## Behavior
 
 - Guidance (0113, 0155): `KANBAN_GUIDANCE` tells workers to call

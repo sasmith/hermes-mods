@@ -271,6 +271,36 @@ def test_traceback_from_hermes_code_is_a_bug_signature():
     assert rules.bug_signature("terminal", "Traceback ... File \"/tmp/mine.py\"\nValueError", "error", None, None) is None
 
 
+def test_memory_guided_refusals_are_agent_mistakes_not_bug_signatures(tmp_path):
+    # Real over-budget refusal (session 20261021_103941_fc2813): the agent's next batch call recovered.
+    over = {"success": False, "error": "Memory at 1,343/1,375 chars; adding this entry (33 chars) would exceed the "
+            "limit by 4 chars. Retry as ONE 'operations' batch that removes or shortens (patch) stale entries ...",
+            "current_entries": ["a", "b"], "usage": "1,343/1,375"}
+    batch = {"success": False, "error": "Applying all 2 operations would put memory at 1,376/1,375 chars. "
+             "No operations were applied (batch is all-or-nothing).", "usage": "1,343/1,375"}
+    nomatch = {"success": False, "error": "No entry matched 'Vast idle-box audit'.", "closest_entries": ["x"]}
+    scan = {"success": False, "error": "Blocked: content contains invisible unicode character U+200B"}
+    for d in (over, batch, nomatch, scan):
+        assert rules.bug_signature("memory", json.dumps(d), "error", None, d["error"]) is None, d["error"]
+    # Hermes may append repeat-failure guidance after the JSON (seen in state.db); still a guided refusal.
+    hinted = json.dumps(nomatch) + "\n\n[This tool call failed the same way twice. Try a different approach.]"
+    assert rules.bug_signature("memory", hinted, "error", None, nomatch["error"]) is None
+    # Hermes-side memory failures still file: unreadable file, drift, and the exhausted per-turn retry cap.
+    unreadable = {"success": False, "error": "Refusing to write MEMORY.md: the file exists on disk but could not "
+                  "be read right now (temporarily locked ...)."}
+    drift = {"success": False, "error": "Refusing to write MEMORY.md: it holds an entry larger ...",
+             "drift_backup": "/h/memories/MEMORY.md.bak"}
+    cap = {"success": False, "done": True, "error": "Memory consolidation failed 4 times this turn. Stop retrying"}
+    for d in (unreadable, drift, cap):
+        assert rules.bug_signature("memory", json.dumps(d), "error", None, d["error"]), d["error"]
+    # Other infra tools keep the old rule, and the end-to-end observer records nothing for the refusal.
+    assert rules.bug_signature("cross_session", json.dumps(over), "error", None, over["error"])
+    c = coach(tmp_path)
+    c.observe("s1", "memory", {"action": "add", "content": "x"}, json.dumps(over), status="error",
+              error_message=over["error"])
+    assert c.signals.bugs(0) == []
+
+
 # ── delivery through the real hook callbacks ──
 def test_hooks_attach_hint_to_tool_result_and_count_turns(tmp_path):
     store = core.Store(tmp_path / "coach")

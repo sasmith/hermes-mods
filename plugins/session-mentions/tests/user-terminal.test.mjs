@@ -1,6 +1,6 @@
 // run_in_user_terminal from a gateway with no screen (nous-1, hermes-hub) is relayed as a
 // `user_terminal` request to the owner's Mac. This Desktop courier runs it on its OWN backend's
-// user-terminal routes, which open the y/N confirm window. These tests pin the courier half:
+// user-terminal routes, which open the run window. These tests pin the courier half:
 // the origin shown in the window is named by the courier (the connection it drained), a
 // non-owner session is refused a second time here, and status reads carry that gateway name.
 import assert from 'node:assert/strict'

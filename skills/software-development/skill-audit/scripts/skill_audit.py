@@ -106,12 +106,25 @@ def acked():
         return set()
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def lost_writes(days):
     """Failed skill_manage calls with no later successful write to the same skill in that session."""
     db = os.path.join(HOME, "state.db")
     if not os.path.exists(db):
         return []
-    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    con = _ro_connect(db, timeout=5)
     since = time.time() - days * 86400
     rows = con.execute(
         "select session_id, timestamp, tool_call_id, content from messages "

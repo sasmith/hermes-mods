@@ -123,8 +123,8 @@ def _ours(path: str | None, text: str, tool: str = "terminal") -> bool:
 
 
 def register_markers(since: float, env, extra_dirs: list[str] | None = None, text: str | None = None,
-                     tool: str = "terminal") -> list[dict]:
-    owner = owner_from_env(env)
+                     tool: str = "terminal", owner: dict | None = None) -> list[dict]:
+    owner = owner_from_env(env) if owner is None else owner
     out = []
     for gd in new_gitdirs(since, extra_dirs):
         path = _wt_path(gd)
@@ -141,11 +141,24 @@ def register_markers(since: float, env, extra_dirs: list[str] | None = None, tex
     return out
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def live_workspace_paths(exclude: str | None = None) -> set[str]:
     """Realpaths of workspace_path of open cards on the worker's board (minus *exclude*). Unreadable => {'*'}."""
     db = os.environ.get("HERMES_KANBAN_DB") or str(H / ".hermes" / "kanban.db")
     try:
-        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
+        c = _ro_connect(db, timeout=10)
         rows = c.execute("select workspace_path from tasks where status not in ('done','archived') and id != ? "
                          "and coalesce(workspace_path,'') != ''", (exclude or "",)).fetchall()
         c.close()

@@ -263,3 +263,96 @@ class SpendSection(unittest.TestCase):
         out = "\n".join(coach_weekly.section_spend(ds, self.NOW, 7, top=2))
         self.assertIn("cron:idle (zzz999)", out)
         self.assertIn("3 more agents", out)
+
+
+class SelfHealLane(unittest.TestCase):
+    """Self-heal lane section: synthetic events + a synthetic Kanban board (no real cards or quotes)."""
+    NOW = 1_800_000_000.0
+    DAY = 86400
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.data = Path(self.tmp.name) / "data"
+        (self.home / "coach").mkdir(parents=True)
+        self.data.mkdir()
+
+    def events(self, rows):
+        with (self.home / "coach" / "log.jsonl").open("a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def board(self, rows):
+        import sqlite3
+        c = sqlite3.connect(self.home / "kanban.db")
+        c.execute("create table tasks (id text primary key, title text, status text, created_at int, completed_at int, "
+                  "result text, idempotency_key text)")
+        c.executemany("insert into tasks values (?,?,?,?,?,?,?)", rows)
+        c.commit()
+        c.close()
+
+    def section(self):
+        with patch("engine_budget.card_cost", lambda home, board, tid: {"t_inv1": 2.0, "t_fix1": 3.0}.get(tid, 1.0)):
+            return "\n".join(coach_weekly.section_selfheal(self.data, self.NOW, 7, homes=[self.home]))
+
+    def test_no_activity(self):
+        out = self.section()
+        self.assertIn("No self-heal activity yet", out)
+        self.assertNotIn("Traceback", out)
+
+    def test_no_home_at_all(self):
+        out = "\n".join(coach_weekly.section_selfheal(self.data, self.NOW, 7, homes=[self.home / "missing"]))
+        self.assertIn("No self-heal activity yet", out)
+
+    def test_stages_recurrence_cost(self):
+        t = self.NOW - 2 * self.DAY
+        self.events([
+            {"ts": t, "event": "selfheal_would_file", "fingerprint": "shadow-a"},
+            {"ts": t, "event": "selfheal_filed", "fingerprint": "ui-aaaaaaaaaa", "card": "t_inv1"},
+            {"ts": t + 60, "event": "selfheal_proposed", "fingerprint": "ui-aaaaaaaaaa"},
+            {"ts": t + 120, "event": "selfheal_approved", "fingerprint": "ui-aaaaaaaaaa"},
+            {"ts": t + 600, "event": "selfheal_fixed", "fingerprint": "ui-aaaaaaaaaa"},
+            {"ts": t, "event": "selfheal_filed", "fingerprint": "fp-b"},
+            {"ts": t + 60, "event": "selfheal_not_defect", "fingerprint": "fp-b"},
+            {"ts": t, "event": "selfheal_filed", "fingerprint": "fp-old", "recurrence": True},
+            {"ts": t, "event": "unrelated", "fingerprint": "x"},
+            {"ts": self.NOW - 10 * self.DAY, "event": "selfheal_filed", "fingerprint": "fp-prev"},
+        ])
+        self.board([("t_inv1", "inv", "done", int(t), int(t + 60), "proposal posted", "selfheal:ui-aaaaaaaaaa"),
+                    ("t_fix1", "fix", "done", int(t + 120), int(t + 600), "fixed", "selfheal:ui-aaaaaaaaaa:fix"),
+                    ("t_other", "x", "done", int(t), int(t), "", "coach-fix:zzz"),
+                    ("t_build", "build", "done", int(t), int(t), "", "selfheal:1-detector")])
+        out = self.section()
+        self.assertIn("| Filed (investigation card) | 3 | 1 |", out)
+        self.assertIn("| Proposed (Inbox, What happened / Why / Plan) | 1 | 0 |", out)
+        self.assertIn("| Approved (Do it) | 1 | 0 |", out)
+        self.assertIn("| Fixed (verified live) | 1 | 0 |", out)
+        self.assertIn("| Closed as not-a-defect (false positive) | 1 | 0 |", out)
+        self.assertIn("| Shadow would-file (not created) | 1 | 0 |", out)
+        self.assertIn("Recurrence: 1 of 3", out)
+        self.assertIn("Spend: $5.00", out)   # the two defect cards, not the coach-fix or build card
+        self.assertIn("$ per fix: $5.00", out)
+
+    def test_recurrence_from_cards(self):
+        t = self.NOW - 3 * self.DAY
+        self.board([("t_f0", "fix", "done", int(t - 20 * self.DAY), int(t - 19 * self.DAY), "", "selfheal-fix:cron-0123456789"),
+                    ("t_i1", "inv", "running", int(t), None, "", "selfheal:cron-0123456789")])
+        out = self.section()
+        self.assertIn("Recurrence: 1 of 1", out)
+        self.assertIn("n/a (no fixes this window)", out)
+
+    def test_snapshot_roundtrip(self):
+        t = self.NOW - self.DAY
+        self.events([{"ts": t, "event": "selfheal_filed", "fingerprint": "fp-s", "quote": "private text"}])
+        snap = self.data / "reports" / "selfheal-lane.jsonl"
+        with patch("engine_budget.card_cost", lambda *a: 0.0):
+            self.assertEqual(coach_weekly.selfheal_export(snap, [self.home]), 1)
+        self.assertNotIn("private text", snap.read_text())  # only content-free fields are exported
+        out = "\n".join(coach_weekly.section_selfheal(self.data, self.NOW, 7, homes=[self.home / "missing"]))
+        self.assertIn("| Filed (investigation card) | 1 | 0 |", out)
+
+    def test_fingerprint_of_keys(self):
+        self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc"), "abc")
+        self.assertEqual(coach_weekly.selfheal_fp("selfheal:abc:fix"), "abc")
+        self.assertEqual(coach_weekly.selfheal_fp("selfheal-fix:abc"), "abc")

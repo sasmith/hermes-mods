@@ -12,11 +12,13 @@ Prints a Markdown block the coach Bot turns into reports/weekly-<date>.md:
   2b. Spend vs output per agent (host/profile x lane: each cron job, Kanban, chats, ...): $ this vs previous window,
      no-op share (empty / [SILENT] / 'nothing to fix' last replies), flags for mostly-no-op agents, crons repeated
      across hosts, and spend that doubled.
+  2c. Self-heal lane: defects filed, proposed, approved, fixed, reverted, closed as not-a-defect; recurrence; $ per
+     fix (selfheal_* coach events + `selfheal:` Kanban cards, or the hub's reports/selfheal-lane.jsonl snapshot).
   3. Each --check: before/after comparison for a config change at a timestamp (sessions fully before vs started
      after, equal-length windows), with a keep / raise / revert recommendation.
   4. Pending and rejected proposals (the Bot must not re-propose rejected ones).
 """
-import argparse, collections, glob, json, re, statistics, sys, time
+import argparse, collections, contextlib, glob, json, re, statistics, sys, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -365,6 +367,222 @@ def revertible(p):
     return any(p.get(k) for k in ("commit", "shared_commit", "backup")) or "prev" in p
 
 
+# ---- Self-heal lane ---------------------------------------------------------------------------------------------
+# Sources (all optional; the section reads "no activity" when there are none):
+#   events  `selfheal_*` rows in <home>/coach/log.jsonl (and <home>/profiles/*/coach/log.jsonl), written by
+#           plugins/coach/self_heal.py and its lane. Vocabulary (one row per transition, `fingerprint` required,
+#           `card` / `component` / `recurrence` / `cost_usd` optional):
+#             selfheal_detect, selfheal_would_file  shadow mode: what it would have filed
+#             selfheal_filed        investigation card created     selfheal_proposed  Inbox proposal posted
+#             selfheal_approved     Do it pressed, fix card started selfheal_fixed     fix verified live ("Fixed: …")
+#             selfheal_reverted     fix undone                      selfheal_not_defect closed as not a defect
+#             selfheal_declined     Not now / Never                 selfheal_recurrence a fixed fingerprint came back
+#   cards   Kanban tasks whose idempotency key starts with `selfheal` and ends in a hashed defect fingerprint
+#           (`selfheal:<fp>` investigation, `selfheal:<fp>:fix` or `selfheal-fix:<fp>` fix card) on every board of
+#           the home: cost = lifetime worker-session cost.
+#   snapshot  <data>/reports/selfheal-lane.jsonl, written by `--selfheal-export` on the hub, so a host without the
+#           lane's logs and boards (the cloud coach Bot) still sees it. Local rows win over snapshot rows.
+SELFHEAL_STAGES = [("filed", "Filed (investigation card)"), ("proposed", "Proposed (Inbox, What happened / Why / Plan)"),
+                   ("approved", "Approved (Do it)"), ("fixed", "Fixed (verified live)"), ("reverted", "Reverted"),
+                   ("not_defect", "Closed as not-a-defect (false positive)"), ("declined", "Declined (Not now / Never)")]
+SELFHEAL_EVENT_KEYS = ("ts", "event", "fingerprint", "card", "component", "recurrence", "cost_usd", "host", "board")
+NOT_DEFECT_RX = re.compile(r"\bnot[ -]a[ -]defect\b|\bno defect\b|\bfalse positive\b", re.I)
+# A defect fingerprint ends in a hash (plugins/coach/self_heal.fingerprint: `<component>-<10 hex>`). Cards keyed
+# `selfheal:` without one (e.g. the lane's own numbered build cards, `selfheal:1-detector`) are not defects.
+DEFECT_FP_RX = re.compile(r"-[0-9a-f]{8,}$")
+
+
+def selfheal_fp(key):
+    """Fingerprint of a `selfheal:` idempotency key (investigation and fix cards share it)."""
+    k = re.sub(r"^selfheal(?:-fix)?:", "", key or "")
+    return re.sub(r"(?::r\d+)?(?::fix)?$", "", k)  # `:r<n>` = a recurrence's investigation (self_heal.file_defect)
+
+
+def selfheal_homes(homes=None):
+    import os
+    if homes:
+        return [Path(h).expanduser() for h in homes]
+    return [Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")]
+
+
+def selfheal_events(homes):
+    out = []
+    for home in homes:
+        for p in [home / "coach" / "log.jsonl", *sorted(home.glob("profiles/*/coach/log.jsonl"))]:
+            if not p.exists():
+                continue
+            for line in p.read_text(errors="replace").splitlines():
+                if '"selfheal_' not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(r, dict) and str(r.get("event", "")).startswith("selfheal_"):
+                    out.append({k: r[k] for k in SELFHEAL_EVENT_KEYS if k in r})
+    return out
+
+
+def selfheal_cards(homes, cost=True):
+    """[{id, key, fingerprint, board, status, created_at, completed_at, fix, not_defect, cost_usd}] across boards."""
+    try:
+        import coach_fixer as fx  # stdlib-only sibling; a host without it (cloud Bot) uses the snapshot
+    except ImportError:
+        return []
+    out = []
+    for home in homes:
+        dbs = [("default", home / "kanban.db")] + [(p.parent.name, p) for p in sorted(home.glob("kanban/boards/*/kanban.db"))]
+        seen = set()
+        for board, db in dbs:
+            if not db.exists() or db.resolve() in seen:
+                continue
+            seen.add(db.resolve())
+            try:
+                with contextlib.closing(fx._ro(db)) as k:
+                    cols = {r[1] for r in k.execute("pragma table_info(tasks)")}
+                    if "idempotency_key" not in cols:
+                        continue
+                    rows = k.execute("select id, idempotency_key, status, created_at, completed_at, coalesce(result, '') "
+                                     "from tasks where idempotency_key like 'selfheal%'").fetchall()
+            except Exception:
+                continue
+            for tid, key, status, c_at, done_at, result in rows:
+                if not DEFECT_FP_RX.search(selfheal_fp(key)):
+                    continue
+                usd = 0.0
+                if cost:
+                    try:
+                        import engine_budget
+                        usd = engine_budget.card_cost(home, board, tid)
+                    except Exception:
+                        usd = 0.0
+                out.append({"id": tid, "key": key, "fingerprint": selfheal_fp(key), "board": board, "status": status,
+                            "created_at": c_at, "completed_at": done_at,
+                            "fix": key.endswith(":fix") or key.startswith("selfheal-fix:"),
+                            "not_defect": bool(NOT_DEFECT_RX.search(result or "")), "cost_usd": usd})
+    return out
+
+
+def selfheal_snapshot(data):
+    p = Path(data) / "reports" / "selfheal-lane.jsonl"
+    ev, cards = [], []
+    if p.exists():
+        for line in p.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            (cards if r.pop("type", "event") == "card" else ev).append(r)
+    return ev, cards
+
+
+def selfheal_load(data, homes=None):
+    homes = selfheal_homes(homes)
+    ev, cards = selfheal_events(homes), selfheal_cards(homes)
+    sev, scards = selfheal_snapshot(data)
+    seen_ev = {(r.get("ts"), r.get("event"), r.get("fingerprint")) for r in ev}
+    ev += [r for r in sev if (r.get("ts"), r.get("event"), r.get("fingerprint")) not in seen_ev]
+    ids = {c["id"] for c in cards}
+    cards += [c for c in scards if c.get("id") not in ids]
+    return ev, cards
+
+
+def selfheal_export(path, homes=None):
+    """Write the lane's events + cards (content-free fields only) for hosts that cannot read them directly."""
+    homes = selfheal_homes(homes)
+    rows = [{"type": "event", **r} for r in selfheal_events(homes)] + [{"type": "card", **c} for c in selfheal_cards(homes)]
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
+    tmp.replace(p)
+    return len(rows)
+
+
+def selfheal_stats(events, cards, lo, hi):
+    """Per-stage distinct fingerprints in [lo, hi), recurrence, shadow would-files, $ and $ per fix."""
+    stage = {s: set() for s, _ in SELFHEAL_STAGES}
+    shadow, recur = set(), set()
+    fixed_before = {}  # fingerprint -> first time it was fixed (any time), for recurrence
+    for r in events:
+        if r.get("event") == "selfheal_fixed" and r.get("fingerprint"):
+            fp = r["fingerprint"]
+            fixed_before[fp] = min(fixed_before.get(fp, r.get("ts") or 0), r.get("ts") or 0)
+    for c in cards:
+        if c.get("fix") and c.get("status") == "done" and c.get("completed_at"):
+            fp = c["fingerprint"]
+            fixed_before[fp] = min(fixed_before.get(fp, c["completed_at"]), c["completed_at"])
+    usd = 0.0
+    for r in events:
+        t, fp = r.get("ts") or 0, r.get("fingerprint") or r.get("card") or "?"
+        if not lo <= t < hi:
+            continue
+        ev = r.get("event", "")[len("selfheal_"):]
+        if ev in ("detect", "would_file"):
+            shadow.add(fp)
+        elif ev == "recurrence":
+            recur.add(fp)
+            stage["filed"].add(fp)
+        elif ev in stage:
+            stage[ev].add(fp)
+        if ev == "filed" and (r.get("recurrence") or (fp in fixed_before and fixed_before[fp] < t)):
+            recur.add(fp)
+        usd += float(r.get("cost_usd") or 0)
+    for c in cards:
+        fp, t = c["fingerprint"], c.get("created_at") or 0
+        if lo <= t < hi:
+            usd += float(c.get("cost_usd") or 0)
+            if c.get("fix"):
+                stage["approved"].add(fp)
+            else:
+                stage["filed"].add(fp)
+                if fp in fixed_before and fixed_before[fp] < t:
+                    recur.add(fp)
+        done = c.get("completed_at") or 0
+        if lo <= done < hi and c.get("status") == "done":
+            if c.get("not_defect"):
+                stage["not_defect"].add(fp)
+            elif c.get("fix"):
+                stage["fixed"].add(fp)
+    n = {s: len(v) for s, v in stage.items()}
+    filed = n["filed"]
+    return {**n, "shadow": len(shadow), "recurrence": len(recur),
+            "recurrence_rate": round(len(recur) / filed, 3) if filed else None,
+            "usd": round(usd, 2), "usd_per_fix": round(usd / n["fixed"], 2) if n["fixed"] else None,
+            "false_positive_rate": round(n["not_defect"] / filed, 3) if filed else None}
+
+
+def section_selfheal(data, now, days, homes=None, events=None, cards=None):
+    if events is None or cards is None:
+        try:
+            ev, cs = selfheal_load(data, homes)
+        except Exception as e:
+            return [f"## Self-heal lane (last {days:g} days)", "", f"Could not read the lane: {type(e).__name__}: {e}"]
+        events = ev if events is None else events
+        cards = cs if cards is None else cards
+    cur = selfheal_stats(events, cards, now - days * 86400, now + 1)
+    prev = selfheal_stats(events, cards, now - 2 * days * 86400, now - days * 86400)
+    out = [f"## Self-heal lane (last {days:g} days)", "",
+           "Defects Hermes filed and fixed without being asked (`selfheal_*` coach events + `selfheal:` cards). "
+           "Counts are distinct defect fingerprints. Pair with the ask-gate KPI `had_to_ask_fix` (target 0).", ""]
+    if not events and not cards:
+        return out + ["No self-heal activity yet: no `selfheal_*` events and no `selfheal:` cards on this host or in "
+                      "reports/selfheal-lane.jsonl (the lane is not live, or nothing was detected)."]
+    out += ["| Stage | this window | previous |", "|---|---:|---:|"]
+    for s, label in SELFHEAL_STAGES:
+        out.append(f"| {label} | {cur[s]} | {prev[s]} |")
+    out.append(f"| Shadow would-file (not created) | {cur['shadow']} | {prev['shadow']} |")
+    out += ["",
+            f"Recurrence: {cur['recurrence']} of {cur['filed']} filed came back after a fix "
+            f"({fmt(cur['recurrence_rate'])}; previous {fmt(prev['recurrence_rate'])}). Each needs a detection-level guard.",
+            f"False-positive rate (not-a-defect / filed): {fmt(cur['false_positive_rate'])} "
+            f"(previous {fmt(prev['false_positive_rate'])}).",
+            f"Spend: ${cur['usd']:,.2f} (previous ${prev['usd']:,.2f}); $ per fix: "
+            + (f"${cur['usd_per_fix']:,.2f}" if cur["usd_per_fix"] is not None else "n/a (no fixes this window)")
+            + (f" (previous ${prev['usd_per_fix']:,.2f})" if prev["usd_per_fix"] is not None else "") + "."]
+    return out
+
+
 def canary_checks(data):
     """CHECKS entries registered by canary applies (status canary with a `check` spec)."""
     return [p["check"] for p in coach_proposals.state(data).values() if p.get("status") == "canary" and p.get("check")]
@@ -380,8 +598,16 @@ def main():
     ap.add_argument("--check", action="append", default=[],
                     help="key=value@ISO-UTC[#signal], e.g. agent.max_turns=150@2026-10-14T05:39Z#synthetic_turn_cap")
     ap.add_argument("--source-target-root", help="Local rollout checkout directory for source-list proposals")
+    ap.add_argument("--home", action="append", default=[],
+                    help="Hermes home(s) whose coach log + Kanban boards feed the self-heal section (default ~/.hermes)")
+    ap.add_argument("--selfheal-export", metavar="PATH",
+                    help="write the self-heal lane snapshot (events + cards) to PATH and exit; the hub writes "
+                         "<data>/reports/selfheal-lane.jsonl so the cloud Bot sees the lane")
     a = ap.parse_args()
     data = Path(a.data)
+    if a.selfheal_export:
+        print(f"selfheal-lane: {selfheal_export(a.selfheal_export, a.home or None)} rows -> {a.selfheal_export}")
+        return
     ds = coach_mine.load(data)
     now = time.time()
     out = [f"# Weekly coach context — {datetime.fromtimestamp(now, coach_yield.PT):%Y-%m-%d %Z} (last {a.days:g} days)",
@@ -389,6 +615,7 @@ def main():
     out += section_kpis(data, ds, now, a.days) + [""]
     out += section_findings(data, ds, now, a.days, a.top) + [""]
     out += section_spend(ds, now, a.days) + [""]
+    out += section_selfheal(data, now, a.days, homes=a.home or None) + [""]
     checks = list(dict.fromkeys(a.check + canary_checks(data)))
     if checks:
         out += ["## Config-change checks", ""]

@@ -149,12 +149,24 @@ def _run(argv: list[str]) -> None:
             pass
 
 
+def _gate_refused(session_id: str) -> bool:
+    """The ask-gate plugin (if installed) judged this turn's asks unverified/stale: never file a card for them.
+    No record = ask-gate absent or down, so behave as before."""
+    try:
+        v = json.loads((_home() / "cache" / "ask-gate" / "verdicts.json").read_text()).get(session_id)
+    except (OSError, ValueError):
+        return False
+    return bool(v) and time.time() - v.get("t", 0) <= 300 and v.get("verdict") in ("held", "unverified")
+
+
 def transform_llm_output(response_text: str = "", session_id: str = "", platform: str = "", **_):
     if not isinstance(response_text, str) or not _eligible(session_id, platform):
         return None
     asks = core.find_asks(response_text)
     if not asks:
         return None
+    if _gate_refused(session_id):
+        return None  # ask-gate could not verify the ask; a blocked card would just publish the unverified premise
     st = _state()
     if st.tracked_since(session_id, st.turn_start(session_id) or time.time() - 600):
         return None  # this turn already filed/blocked a card for it

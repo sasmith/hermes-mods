@@ -170,3 +170,12 @@ test('linkSegments: web URLs and local paths become links; fractions, and/or and
   assert.deepEqual(m.linkSegments('no links here, 1/2 done'), [{ kind: 'text', value: 'no links here, 1/2 done' }])
   assert.deepEqual(m.linkSegments(''), [])
 })
+
+test('linkSegments: scheme-less web addresses link with an https href; file names and emails do not', () => {
+  const t = 'Open github.com/settings/billing while signed in. Edit plugin.js, README.md; mail someone@example.com.'
+  const links = m.linkSegments(t).filter(s => s.kind !== 'text')
+  assert.deepEqual(links, [{ kind: 'url', value: 'github.com/settings/billing' }])
+  assert.equal(m.linkHref(links[0]), 'https://github.com/settings/billing')
+  assert.equal(m.linkHref({ kind: 'url', value: 'https://a.io' }), 'https://a.io')
+  assert.equal(m.linkSegments(t).map(s => s.value).join(''), t)
+})

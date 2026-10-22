@@ -7,6 +7,9 @@ Patches:
 - `patches/0120-fix-tool-search-forward-tool_call-to-directly-listed.patch`: tools. New config key
   `tools.tool_search.forward_direct_calls` (default `false`): a `tool_call` that names a directly-listed tool runs
   it instead of refusing.
+- `patches/0168-fix-tool_search-tool_describe-names-the-disabled-too.patch`: tools. `tool_describe` on a registered
+  direct tool that is missing from this session (its toolset is off for the platform) says so and names the fix,
+  instead of "directly-listed tool ... call it directly".
 
 What you see: tools you use all the time (for example `process_manage`, or a plugin tool like `cross_session`) are
 in the agent's tool list directly. Without this the agent sees only their names in the `tool_search` catalog and
@@ -29,6 +32,12 @@ has to search/describe them first, or misses them. Stock Hermes can make a core 
   `tool_describe`) and unknown names are still refused. Accepts `true/1/yes/on` and `false/0/no/off`; anything
   else → `false`.
 - A non-list value logs a warning and is ignored.
+- **Disabled toolset (0168)**: `tool_describe` of a registered, non-deferrable tool that is not in the session's
+  tool list returns "'X' is registered but NOT enabled in this session: its toolset 'T' is off for this platform.
+  Enable it with `hermes tools enable T --platform cli` ... then start a new session." The old answer ("directly-listed
+  tool, call it directly") sent an agent looking for a tool it did not have: on a host whose `cli` platform never
+  opted into the default-off `kanban` toolset, `kanban_create` was missing and the agent gave up on filing a card.
+  A tool that IS in the session still gets the "directly-listed" answer.
 
 ## How it works
 
@@ -67,6 +76,15 @@ has to search/describe them first, or misses them. Stock Hermes can make a core 
 - `test_forward_still_enforces_session_scope_and_schema`: out-of-scope and missing-required-argument calls still fail.
 - `test_forward_never_admits_bridge_or_unknown_names`.
 - `test_forward_config_parses_and_defaults_off`.
+
+`tests/tools/test_tool_describe_gated_toolset.py` (0168):
+
+- `test_describe_absent_from_session_names_the_toolset_and_fix`: registered eager tool, empty session defs → the
+  "NOT enabled" error with the `hermes tools enable <toolset> --platform cli` command. Fails before 0168.
+- `test_describe_present_in_session_still_says_call_directly`: same tool in the session's defs → "directly-listed".
+
+Both pass, plus the 127 other tests in the tool_search/tool_call files (Oct 21, 2026 PT, `scripts/run_tests.sh`).
+The `tool_call` path is unchanged (forwarding or the session-scope gate handles it): untested for this message.
 
 All 6 pass (Oct 17, 2026 PT, `scripts/run_tests.sh`). The real symptom (a live config edit while a session runs) is
 reproduced by swapping `load_config_readonly` in the test, not by editing a config file under a running session:

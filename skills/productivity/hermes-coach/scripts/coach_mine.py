@@ -6,6 +6,9 @@
 DIR is the digest repo (<host>/<profile>/<id>.json). Prints a Markdown context block for the coach
 agent: KPIs per host and overall (this window vs the previous one), then the top-N unlabeled
 sessions by waste score with their user turns. Labeled = id present in DIR/findings/*.jsonl.
+Excluded profiles: DIR/exclude-profiles.txt lines and --exclude-profile args, each HOST/PROFILE_GLOB (e.g.
+somehost/alpha*), drop shared team bots (Slack followers etc.) whose "user turns" are other people's chat, so
+they never reach the KPIs or the labeling queue even if a feed pushed their digests.
 --write-kpis also appends the window's KPIs to DIR/reports/kpis.jsonl (one line per run day).
 --write-adoption evaluates every curriculum entry's `adopted` test over the digests and writes
 DIR/reports/adoption.json (the coach plugin on each Mac reads it to retire adopted tips). Curriculum =
@@ -13,7 +16,7 @@ DIR/reports/adoption.json (the coach plugin on each Mac reads it to retire adopt
 overlaid by DIR/curriculum/*.yaml (hosts' private overlays, copied there by coach_feed.py). Needs PyYAML or
 ruamel.yaml for the YAML (the Hermes venv has ruamel).
 """
-import argparse, collections, glob, json, os, re, statistics, time
+import argparse, collections, fnmatch, glob, json, os, re, statistics, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -48,17 +51,55 @@ def fmt_other_sources(o):
                                 or "none") + " (excluded from interactive KPIs)"
 
 
-def load(data: Path):
+NON_DIGEST_DIRS = {"reports", "findings", "research", "eval"}
+EXCLUDE_FILE = "exclude-profiles.txt"
+
+
+def exclude_patterns(data: Path, extra=()):
+    """HOST/PROFILE_GLOB patterns from DIR/exclude-profiles.txt (# comments ok) plus extra."""
+    pats = []
+    f = data / EXCLUDE_FILE
+    if f.exists():
+        pats += [l.split("#", 1)[0].strip() for l in f.read_text().splitlines()]
+    pats += list(extra or ())
+    return [p for p in pats if p and "/" in p]
+
+
+def is_excluded(d, patterns):
+    """Digest belongs to an excluded host/profile (shared team bot): fnmatch on both halves."""
+    host, prof = d.get("host") or "", d.get("profile") or ""
+    for p in patterns:
+        ph, _, pp = p.partition("/")
+        if fnmatch.fnmatchcase(host, ph) and fnmatch.fnmatchcase(prof, pp):
+            return True
+    return False
+
+
+def labeling_queue(cur, done, top):
+    """Top-N unlabeled sessions with user turns by waste score (cron excluded)."""
+    return sorted((d for d in cur if d["id"] not in done and d.get("user_turns")
+                   and d.get("source") not in ("cron",)), key=waste, reverse=True)[:top]
+
+
+def load(data: Path, exclude=None):
+    """Digests under DIR/<host>/<profile>/. exclude=None reads DIR/exclude-profiles.txt; pass a list to override."""
+    pats = exclude_patterns(data) if exclude is None else exclude
     out = []
     for f in glob.glob(str(data / "*" / "*" / "*.json")):
-        if "/reports/" in f or "/findings/" in f or "/research/" in f:
+        # By top-level path component, so a relative --data ("reports/askgate/x.json") is skipped too.
+        try:
+            top = Path(f).relative_to(data).parts[0]
+        except ValueError:
+            top = Path(f).parts[-3]
+        if top in NON_DIGEST_DIRS:
             continue
         try:
             d = json.load(open(f))
         except Exception:
             continue
-        if isinstance(d, dict) and d.get("host"):  # research/state/seen.json etc. are not digests
-            out.append(d)
+        if isinstance(d, dict) and d.get("host") and d.get("id"):  # research/state/seen.json etc. are not digests
+            if not is_excluded(d, pats):
+                out.append(d)
     return out
 
 
@@ -295,9 +336,12 @@ def main():
     ap.add_argument("--write-kpis", action="store_true")
     ap.add_argument("--write-adoption", action="store_true")
     ap.add_argument("--curriculum", action="append", default=[], help="public curriculum file(s); overlays come from DIR/curriculum/")
+    ap.add_argument("--exclude-profile", action="append", default=[],
+                    help="HOST/PROFILE_GLOB to drop (shared team bot); adds to DIR/exclude-profiles.txt")
     a = ap.parse_args()
     data = Path(a.data)
-    ds = load(data)
+    pats = exclude_patterns(data, a.exclude_profile)
+    ds = load(data, pats)
     now = time.time()
     lo, plo = now - a.days * 86400, now - 2 * a.days * 86400
     act = lambda d: d.get("last_activity_at") or d.get("started_at") or 0
@@ -309,7 +353,8 @@ def main():
         by_host[d["host"]].append(d)
     overall = kpis(cur)
     out = [f"# Coach data — last {a.days:g} days ({time.strftime('%Y-%m-%d')})",
-           f"Digests loaded: {len(ds)} across hosts {sorted({d['host'] for d in ds})}.", "",
+           f"Digests loaded: {len(ds)} across hosts {sorted({d['host'] for d in ds})}"
+           + (f" (excluded profiles: {', '.join(pats)})." if pats else "."), "",
            "## KPIs, all hosts (interactive sessions)", fmt_kpis(overall, kpis(prev)), "",
            fmt_other_sources(other_sources(cur)), ""]
     for h in sorted(by_host):
@@ -333,8 +378,7 @@ def main():
                 fmt_adoption(res)]
 
     done = labeled_ids(data)
-    queue = sorted((d for d in cur if d["id"] not in done and d.get("user_turns")
-                    and d.get("source") not in ("cron",)), key=waste, reverse=True)[: a.top]
+    queue = labeling_queue(cur, done, a.top)
     out += ["", f"## Labeling queue: top {len(queue)} unlabeled sessions by waste score", ""]
     for d in queue:
         st = time.strftime("%Y-%m-%d %H:%M", time.localtime(d["started_at"]))

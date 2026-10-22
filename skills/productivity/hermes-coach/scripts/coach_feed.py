@@ -9,7 +9,7 @@ Meant for launchd/cron every ~30 min. Prints one JSON status line.
 Also copies this host's private curriculum overlay (<home>/coach/curriculum.yaml, if any) to
 <repo-dir>/curriculum/<host>.yaml, so the miner on the coach Bot can check its adoption tests.
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, re, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -52,6 +52,59 @@ def resolve_unmerged(repo):
     return resolved, unresolved
 
 
+def forward_signals(host, home=None, runner=subprocess.run):
+    """Self-heal machine-signal forwarder (no agent, no LLM): ship this host's new raw signals (tracebacks, failed
+    crons, twice-failed cards, gateway crashes, coach handoff events) to the hub, which files them. Rides on this
+    launchd job (every 30 min). A no-op unless <home>/coach/selfheal-config.json names a hub that is not this host;
+    a failure never stops the digest feed, and the forwarder's cursor only moves when the hub accepted the batch."""
+    # A skills-only (sparse) hermes-mods clone has no plugins/: fall back to the full clone.
+    cands = [HERE.parents[3] / "plugins" / "coach" / "signals.py",
+             Path.home() / "code" / "hermes-mods" / "plugins" / "coach" / "signals.py"]
+    script = next((c for c in cands if c.exists()), None)
+    if script is None:
+        return "no signals.py"
+    cmd = [sys.executable, str(script), "--host", host] + (["--home", home] if home else []) + ["forward"]
+    try:
+        r = runner(cmd, capture_output=True, text=True, timeout=150)
+    except Exception as exc:
+        return f"error: {type(exc).__name__}"
+    out = (r.stdout or r.stderr or "").strip()[-200:]
+    return out or "ok" if r.returncode == 0 else f"error: {out}"
+
+
+def signals_state(out):
+    """Collapse a forwarder result to a state that only changes when the forwarder's health does (so the status
+    file is not rewritten, and committed, every 30 min just because the signal count moved)."""
+    if out.startswith("error"):
+        return "error"
+    if "no hub configured" in out:
+        return "no-hub"
+    if "this host is the hub" in out:
+        return "hub"
+    if "forwarded" in out or "heartbeat ok" in out:
+        return "ok"
+    return "unknown"
+
+
+def write_feed_status(repo, host, out, now=None):
+    """<repo>/<host>/feed-status.json = {signals: state, detail, since}: lets the hub see a Mac forwarder that never
+    reached it (no config, ssh refused, crash) from the data repo, without a shell on that Mac. Rewritten only when
+    the state or error text changes. Returns True if written."""
+    p = Path(repo) / host / "feed-status.json"
+    state = signals_state(out)
+    detail = re.sub(r"\(\d+ pending\)", "(pending)", out) if state in ("error", "no-hub", "unknown") else ""
+    try:
+        old = json.loads(p.read_text())
+    except Exception:
+        old = {}
+    if old.get("signals") == state and old.get("detail", "") == detail:
+        return False
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"signals": state, "detail": detail,
+                             "since": now or time.strftime("%Y-%m-%d %H:%M:%S %z")}, indent=1) + "\n")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
@@ -63,6 +116,7 @@ def main():
     a = ap.parse_args()
     repo = Path(a.repo_dir)
     status = {"host": a.host, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}
+    status["signals"] = forward_signals(a.host, a.home)
 
     def heal(when):
         resolved, unresolved = resolve_unmerged(repo)
@@ -99,6 +153,7 @@ def main():
         copy.parent.mkdir(exist_ok=True)
         copy.write_bytes(overlay.read_bytes())
     if (repo / a.host).exists():
+        write_feed_status(repo, a.host, status["signals"])
         git(repo, "add", "-A", a.host)
     if copy.exists():
         git(repo, "add", str(copy.relative_to(repo)))

@@ -1,0 +1,7 @@
+name: branch-pin-guard
+version: 0.1.0
+description: "Keeps pinned checkouts (sync mirrors, deploy checkouts) on their branch: blocks git checkout/switch that would move one off it and points at git worktree add; warns if one drifted anyway."
+author: daveey
+provides_hooks:
+  - pre_tool_call
+  - transform_tool_result

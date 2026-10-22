@@ -96,6 +96,21 @@ def test_no_card_when_ask_points_at_an_already_blocked_card(env):
     assert made == []
 
 
+def test_no_card_when_ask_gate_refused_the_ask(env):
+    tmp, _, made = env
+    gate = tmp / "cache" / "ask-gate"
+    gate.mkdir(parents=True)
+    import time as _t
+    (gate / "verdicts.json").write_text(json.dumps({"s7": {"t": _t.time(), "verdict": "unverified", "h": "x"}}))
+    plugin.pre_llm_call(session_id="s7", platform="tui")
+    assert plugin.transform_llm_output(response_text=ASKED2, session_id="s7", platform="tui") is None
+    assert made == []
+    # an ok verdict (or no record) files as before
+    (gate / "verdicts.json").write_text(json.dumps({"s7": {"t": _t.time(), "verdict": "ok", "h": "x"}}))
+    assert plugin.transform_llm_output(response_text=ASKED2, session_id="s7", platform="tui")
+    assert len(made) == 1
+
+
 def test_workers_and_cron_are_skipped(env, monkeypatch):
     _, _, made = env
     assert plugin.transform_llm_output(response_text=ASKED2, session_id="s4", platform="cron") is None

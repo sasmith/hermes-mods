@@ -1,0 +1,14 @@
+name: mac-ops
+version: 0.1.0
+description: >
+  Owner-only machine repair tools for a screenless gateway: mac_diag, mac_fix (vetted playbooks; logout/reboot only
+  after the owner replies yes in the Slack thread; the Mac shim re-checks that yes with Slack itself via --approval), mac_screen (screenshots and input through the other Mac), and
+  mac_reply, all over a forced-command ssh shim on each Mac. Registers nothing unless the profile config has
+  mac_ops.enabled: true, so ambient bot profiles never get the tools.
+author: daveey
+license: MIT
+provides_tools:
+  - mac_diag
+  - mac_fix
+  - mac_screen
+  - mac_reply

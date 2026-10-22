@@ -118,13 +118,26 @@ def board_paths(home: Path, boards=None) -> list[tuple[str, Path]]:
     return out
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def _ro(path: Path) -> sqlite3.Connection:
     """Read-only open; `mode=ro` can fail transiently while a writer truncates the WAL, so retry, then fall
     back to a normal open with query_only."""
     import time
     for attempt in range(3):
         try:
-            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=15)
+            con = _ro_connect(path, timeout=15)
             con.execute("select 1 from tasks limit 1")
             break
         except sqlite3.OperationalError:

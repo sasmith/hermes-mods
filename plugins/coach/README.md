@@ -133,6 +133,124 @@ restated rule reuses the existing slug instead of starting a new candidate. Each
 A rejected slug stays rejected. A `saved` rule (already in memory) only produces a reminder. The agent gets the rule as a hint right away. Once a rule is promoted, the hint
 also tells it to save the rule with the memory tool unless memory already has it. `COACH_LESSONS=0` turns this off.
 
+### Self-heal detectors (`self_heal.py`, shadow by default)
+
+Spots an agent/Hermes defect as early as possible, so a fix can be filed without you asking.
+Two entry paths, one result `{p_defect, kind, component, symptom, fingerprint, source}`:
+
+- **Complaint** (`pre_llm_call`): every real message except bare acks, slash commands and Hermes-written notices
+  goes to the aux judge `coach_defect`, with the agent's previous reply and that turn's tool log. It counts
+  corrections ("you buy the credits"), failed fixes ("nope, still broken"), needless handoffs ("you have ssh"),
+  frustration, Hermes or product misbehaviour, and nudges ("resume", "what's going on") after a stalled turn.
+  A first-stage score >= 0.6 escalates: a second flash opinion on a stricter prompt and, when
+  `auxiliary.coach_defect_confirm` (or `COACH_DEFECT_CONFIRM_MODEL`) is set, a stronger model on the same prompt;
+  `p_defect` is the mean of the stage scores. Outside-world problems (`kind: external`) never count.
+- **Turn end** (`post_llm_call`): machine signals first, no judge (a provider-error reply, an interrupted turn, one
+  tool error repeated 3×). Then, when the reply admits a mistake, hands you a step, or the turn's tool log shows
+  errors, a turn-end audit by the same judge; only self-admissions file (the other audit kinds cost more false alarms
+  than they catch), at `COACH_SELFHEAL_AUDIT_THRESHOLD` (default 0.9, after the confirm model when set).
+
+Both judges append the private overlay `COACH_REPLY_PROFILE` / `<HERMES_HOME>/coach/reply_profile.md` (shared with
+the reply check), so they know your standing rules.
+
+Both run in a background thread (the turn never waits) and are fail-open. They skip cron, subagents and Kanban
+workers. `COACH_SELFHEAL=off|shadow|live` (default `shadow`): shadow logs a `selfheal_detect` event to
+`coach/log.jsonl`; live also appends the defect to `coach/selfheal_queue.jsonl` for the self-heal lane, once per
+fingerprint per UTC day (`coach/selfheal.json` holds the fingerprints). The fingerprint is a hash of the component
+and the symptom's stemmed content words, so "sidebar sessions reshuffle" and "session sidebar reshuffles" match.
+`COACH_SELFHEAL_THRESHOLD` (default 0.6). Set the judge model with `auxiliary.coach_defect.provider` / `.model`
+(evaluated on `gemini-3.8-flash`) and the confirm model with `auxiliary.coach_defect_confirm` (evaluated on
+`claude-sonnet-5-5`).
+
+Replay evals:
+- `eval/selfheal_incident_replay.py` (`run`, then `score --relabel --report`): the production code over an
+  incident-labeled turn set (episodes + five-whys verdicts + every normal turn), scored like the self-correct replay:
+  caught before any fix ask, caught counting the fix ask, false positives per normal turn, every miss with its quote,
+  every false positive, catch per root-cause cluster.
+- `eval/selfheal_replay.py`: per-turn catch rate / precision on a hand-labeled set (`--mode admission` for the audit).
+The real sets hold your own words, so they live in the private coach data repo.
+
+### Self-heal lane (`self_heal.py file_defect` → investigation → Inbox proposal → Do it → fix)
+
+Every new fingerprint (first time that UTC day) goes to `file_defect(d)`, from any entry path: the two hooks above
+(complaint, admission, turn-end machine signal), the digest backstop, and direct callers (machine-signal sweepers,
+monitors). `d` = `{fingerprint, component, symptom, source, kind, p_defect, session_id, quote, host, at, details}`.
+
+- **Where it decides.** On the hub (`coach/selfheal-config.json`: `hub_host`, `hub_ssh`, `board`, `bb_board`; no hub
+  configured = this host) it decides locally; on any other host, live mode pipes `d` to `self_heal.py file --mode live`
+  on the hub over ssh, so dedupe, recurrence, suppression and budget live in one place (`coach/selfheal_lane.json`).
+- **Shadow** (`COACH_SELFHEAL=shadow`, else `mode` in `coach/selfheal-config.json`, default shadow) logs `selfheal_would_file` with the full card args and creates
+  nothing. **Live** creates the investigation card.
+- **Investigation card**: key `selfheal:<fp>`, created_by `self-heal`, model `claude-opus-5-5`, 1 h, skills five-whys +
+  hermes-mods-repo (Baby Bear: board `bb`, five-whys + bb-self-fix). Its brief makes it investigate live, with a
+  per-component checklist (Kanban events/runs, surface writer + backing state, processes/launchd/logs, git log), write
+  the five-whys chain, and post ONE Inbox card of type `selfheal` (key `selfheal:<fp>`): **What happened** (symptom,
+  PT time, `@session` link, quote), **Why** (the chain with evidence), **Plan** (changes, regression test, detection
+  guard, live check), cost/risk, undo. It never ships the fix. Not a defect → `event not_defect`, no Inbox card.
+- **Do it** resolves the Inbox card; the hub cron (every 5 min) sees the outcome and runs `file_fix` (also `self_heal.py fix <fp>` by hand): fix card `selfheal:<fp>:fix` whose acceptance is the
+  regression test red before / green after, ship under the standing approval, verify live, and re-post the same key
+  as a `selfheal-result` card "Fixed: …" with the proof (OK / Undo). **Not now** snoozes the fingerprint 14 days,
+  **Never** suppresses it. (Do it is not a Kanban `task` action because a worker is fenced from creating cards via the CLI.)
+- **Recurrence**: a fixed fingerprint that comes back files `selfheal:<fp>:r<n>`, whose brief says "previous fix <id>
+  didn't hold" and requires a detection-level guard.
+- **Budget**: engine_budget lane `selfheal` ($25/UTC day, its own cap outside the $20 engine total; spend = these
+  cards' worker sessions), ≤ 3 running, ≤ 1 filing per fingerprint per UTC day. Over the $ cap the card is created
+  and scheduled to the next UTC midnight; at 3 running, 1 h out. Each card body carries a `Budget for this card` line
+  ($8 investigation, $15 fix) for the engine watchdog.
+- **Hub cron** (`~/.hermes/scripts/selfheal_lane.py` → `self_heal.cron`, every 5 min, no agent): Inbox sync, queue drain, and every 25+ min the digest backstop (the complaint detector over
+  new user turns of interactive sessions in the coach digests, per-session cursor; the judge gets each turn's `prev`
+  agent reply from digest v6 plus the session title and the 3 earlier user turns, since without them the strict stage
+  scored context-free reports like "why didnt this work [screenshot]" as new issues), Inbox sync. In the cascade a
+  stage whose answer is empty or unparseable is retried once and then left out of the mean, not counted as a 0.
+- Events (coach `log.jsonl`, read by `coach_weekly.py`): `selfheal_would_file`, `_filed`, `_recurrence`, `_skip`,
+  `_proposed`, `_approved`, `_fixed`, `_reverted`, `_not_defect`, `_declined`. Cards report theirs with
+  `self_heal.py event <kind> <fp> --card <id>`. `self_heal.py status` prints the lane state and budget.
+- Tests: `tests/test_self_heal_lane.py` (each entry path, dedupe, recurrence, budget, bb routing, shadow vs live,
+  Do it → fix card, Not now / Never). `COACH_SELFHEAL_NO_EXEC=1` (set by the test conftest) refuses any real
+  `hermes`/ssh call.
+
+### Machine-signal sweeper (`signals.py`, no agent, no LLM)
+
+Raw machine signals become `file_defect` calls with `source: signal` and stable fingerprints:
+
+| kind | source | fingerprint (host in it?) |
+|---|---|---|
+| `errors` | new tracebacks in `<home>/logs/errors.log` (any level), minus tool output (`agent.tool_executor`) and provider transients (429/529/overloaded/timeouts) | exception type + innermost 4 frames as `file:function`, no line numbers (no) |
+| `hook` | `Hook '<hook>' callback <cb> raised: …` (plugin hook exceptions) | hook + callback + exception type (no) |
+| `cron` | a job whose sticky `last_failure.at` is new (`cron/jobs.json`), even if it has recovered since | job name (yes) |
+| `kanban` | a card with ≥ 2 runs `crashed` / `timed_out` / `spawn_failed`, every board db; self-heal's own `selfheal:` cards are skipped | board + card id (yes) |
+| `gateway` | `gateway.previous_unclean_exit`, `asyncio.run.exception`, `gateway.exit_nonzero` in `logs/gateway-exit-diag.log` (a clean exit or a code-75 restart is not a crash) | tag + exception type (yes) |
+| `coach` | coach `fixloop_card` (2nd confirmed failure of a fix) and `reply_nudge` with rule `handoff` | session (+ issue) (no) |
+| `monitor` | a propose-only monitor's finding (`route-monitor`, below) | the monitor's own dedupe key |
+
+Profiles (`<home>/profiles/*`) are swept too. Cursor `<home>/coach/signals-cursor.json` (offset + inode per log, last
+run id per board, last failure per job); first sight looks back 7 days; a rotated log is re-read; ≤ 25 signals per
+kind per pass, same fingerprint folded into one (`seen Nx`).
+
+- **Hub**: cron `self-heal signals (hub)` (`~/.hermes/scripts/selfheal_signals.py` → `signals.py --host hermes-hub
+  sweep`, every 30 min, from the scheduler since a Kanban worker can't create cards). It also drains
+  `<home>/coach/signals/spool.jsonl`, where the other hosts' signals land.
+- **Macs / mini**: `signals.py forward` ships new raw signals over ssh to the hub's `signals.py ingest` (the hub
+  files them); the cursor only moves when the hub accepted the batch. Every pass sends a heartbeat first (even with
+  no signals), recorded in the hub's `coach/signals/hosts.json`; the hub sweep files a `plugin` defect for a host
+  whose forwarder has been silent > 6 h. It rides on the existing launchd coach feed
+  (`hermes-coach/scripts/coach_feed.py`, every 30 min) and is a no-op without a `hub_ssh` in
+  `coach/selfheal-config.json` or on the hub itself. The ssh to the hub pins the key (`hub_ssh_key` in that file,
+  default `~/.ssh/id_ed25519`) with `IdentitiesOnly=yes`, because launchd jobs offer different default identities
+  than a shell and the hub refuses them preauth. Each outcome prints one line, which the feed records as
+  `<host>/feed-status.json` in the coach data repo (`signals`: ok / no-hub / hub / error, plus the error text and
+  `since`; rewritten only when that state changes). That file is the hub's view of a forwarder that has never
+  reached it, which the silent-host check can't see.
+- **Monitors**: `signals.py route-monitor` (JSON `{monitor, key, title, body, prompt, component}` on stdin) files the
+  finding and prints `{"owned": …}`. `owned` = the lane filed it or already has it open; then the monitor posts no
+  Do-it card and the investigation posts the What happened / Why / Plan proposal. In shadow mode (or on any error)
+  it is not owned and the monitor posts its old card. Callers: mac-worktree-gc (leaks, GC abort, stale report),
+  guard-conformance, and `coach_askgate.py --post --selfheal` (each hit the lane has no filing for; the weekly card
+  keeps its review prompt only for hits the lane did not take).
+- Tests: `tests/test_signals.py` (one per source with fixtures in `tests/fixtures/signals/`, cursor, rotation, hub
+  sweep in shadow, forwarder success/failure, ingest, monitor routing and `lane_owns`; also passes under Python 3.9,
+  the Macs' `/usr/bin/python3`).
+
 ## User channel (Desktop panel above the composer)
 
 Each panel has one primary button and Dismiss. No menus.
@@ -201,6 +319,9 @@ Both calls fail open when coach isn't loaded.
 ## Files
 
 - `__init__.py`: the hooks (`pre_llm_call`, `post_tool_call`, `transform_tool_result`).
+- `self_heal.py`: the complaint and self-admission detectors, fingerprints and shadow/live handling;
+  `eval/selfheal_replay.py` replays them over a labeled set.
+- `signals.py`: the machine-signal sweeper, forwarder and monitor router (stdlib, Python 3.9+).
 - `agent_rules.py`: the agent-channel rules, plus the signals the user channel needs (subagents, long jobs, bug signatures).
 - `core.py`: the file store under `<HERMES_HOME>/coach/` (`sessions/<id>.json`, `bugs.jsonl`, `log.jsonl`), the gate, the user-rule evaluation, the briefs (spin-out's transcript reader + aux task `coach`) and stats.
 - `second_opinion.py`: the fix-loop review card and the unverified-diff review (settings, repo/diff detection, the

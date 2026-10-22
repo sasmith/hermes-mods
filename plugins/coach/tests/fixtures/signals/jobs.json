@@ -1,0 +1,12 @@
+{"jobs": [
+  {"id": "aaaaaaaaaaaa", "name": "nightly export", "script": "export.py", "last_status": "error",
+   "last_error": "Script exited with code 1", "failure_streak": 2, "last_run_at": "2026-10-22T08:10:00+00:00",
+   "last_failure": {"at": "2026-10-22T08:10:00+00:00", "detail": "Script exited with code 1\nValueError: bad row"}},
+  {"id": "bbbbbbbbbbbb", "name": "healthy job", "script": "ok.py", "last_status": "ok", "last_error": null,
+   "failure_streak": 0, "last_run_at": "2026-10-22T08:10:00+00:00"},
+  {"id": "cccccccccccc", "name": "recovered job", "script": "flaky.py", "last_status": "ok", "last_error": null,
+   "failure_streak": 0, "last_run_at": "2026-10-22T08:20:00+00:00",
+   "last_failure": {"at": "2026-10-22T08:00:00+00:00", "detail": "Script exited with code 2"}},
+  {"id": "dddddddddddd", "name": "ancient failure", "script": "old.py", "last_status": "ok",
+   "last_failure": {"at": "2026-09-01T08:00:00+00:00", "detail": "Script exited with code 1"}}
+]}

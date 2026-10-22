@@ -1,0 +1,561 @@
+From d5f8a69c87df2e75cbf9fa09427a2440bdafa3b5 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 21:51:48 -0700
+Subject: [PATCH] fix(kanban): refusals and backend startup name a leaked
+ worker env; scrub TERMINAL_CWD/UI session too [daveey]
+
+Hermes.app pid 59331 (reopened by kanban worker t_45d5a361's `hermes update`) fenced every
+Desktop chat with 'delegate_task child contexts cannot mutate Kanban', which never said why.
+
+Detection: top_level_env.leaked_worker_env_diagnosis() reads the lineage card (HERMES_KANBAN_TASK,
+else the workspace dir name) from the pinned board and calls the marker leaked when that card is
+not running, its worker pid is gone, or this process does not descend from it; it stays silent
+when the lineage can't be identified or the board can't be read (a real delegate child or a
+worker's own tool subprocess descends from a live running worker). The db fence (kanban_db),
+the CLI fast-fail and the tool refusal append it when the fence comes from the env (not an
+in-process child), and the serve/dashboard/desktop/gateway startup scrub logs it.
+
+Scrub gap: the shared agent-scope list (9778500b6b) missed the dispatcher's TERMINAL_CWD pin
+(file tools/context files anchored in the dead worker's workspace) and the gateway session vars
+outside HERMES_SESSION_ (HERMES_UI_SESSION_ID, HERMES_BROWSER_CONTROL_*); a test now pins the list
+to gateway.session_context._VAR_MAP. Electron mirror updated.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ agent/delegation_context.py                   |   5 +
+ .../electron/leaked-worker-env.test.ts        |  14 ++
+ apps/desktop/electron/leaked-worker-env.ts    |   7 +-
+ hermes_cli/kanban.py                          |   4 +-
+ hermes_cli/kanban_db.py                       |   7 +-
+ hermes_cli/top_level_env.py                   | 144 +++++++++++-
+ tests/hermes_cli/test_leaked_worker_env.py    | 218 ++++++++++++++++++
+ tools/kanban_tools.py                         |  13 +-
+ 8 files changed, 401 insertions(+), 11 deletions(-)
+ create mode 100644 tests/hermes_cli/test_leaked_worker_env.py
+
+diff --git a/agent/delegation_context.py b/agent/delegation_context.py
+index d1e0b113eb..4413bc9d4a 100644
+--- a/agent/delegation_context.py
++++ b/agent/delegation_context.py
+@@ -47,6 +47,10 @@ AGENT_SCOPE_EXACT_KEYS: tuple[str, ...] = (
+     "HERMES_SINGLE_QUERY_SESSION",
+     "HERMES_SPAWN",
+     "HERMES_SUPERVISED_CHILD",
++    # The dispatcher pins TERMINAL_CWD to the worker's workspace; a Desktop that inherits it
++    # anchors file tools and context files there (pid 59331 had .../workspaces/t_45d5a361).
++    "TERMINAL_CWD",
++    "HERMES_UI_SESSION_ID",  # gateway.session_context._VAR_MAP outside the HERMES_SESSION_ prefix
+ )
+ AGENT_SCOPE_PREFIXES: tuple[str, ...] = (
+     "HERMES_KANBAN_",
+@@ -55,6 +59,7 @@ AGENT_SCOPE_PREFIXES: tuple[str, ...] = (
+     "HERMES_PARENT_",
+     "HERMES_RPC_",
+     "HERMES_KERNEL_",
++    "HERMES_BROWSER_CONTROL_",
+ )
+ # Operator tunables sharing those prefixes (HERMES_CRON_TIMEOUT, HERMES_SESSION_STALL_TIMEOUT,
+ # HERMES_CRON_MAX_PARALLEL, HERMES_KANBAN_GUARD_HOLD_CAP_SECONDS...) are config, not identity.
+diff --git a/apps/desktop/electron/leaked-worker-env.test.ts b/apps/desktop/electron/leaked-worker-env.test.ts
+index 89b8967852..8f2d3c1c20 100644
+--- a/apps/desktop/electron/leaked-worker-env.test.ts
++++ b/apps/desktop/electron/leaked-worker-env.test.ts
+@@ -61,6 +61,20 @@ describe('scrubLeakedWorkerEnv', () => {
+     })
+   })
+ 
++  it('drops the dispatcher TERMINAL_CWD pin and UI session id that rode along (pid 59331)', () => {
++    const env: NodeJS.ProcessEnv = {
++      HERMES_DELEGATED_CHILD_CONTEXT: '/Users/x/.hermes',
++      HERMES_UI_SESSION_ID: 'ui-1',
++      HERMES_BROWSER_CONTROL_PRINCIPAL: 'p',
++      TERMINAL_CWD: '/Users/x/.hermes/kanban/workspaces/t_45d5a361',
++      TERMINAL_TIMEOUT: '180',
++      PATH: '/bin'
++    }
++
++    scrubLeakedWorkerEnv(env)
++    expect(env).toEqual({ PATH: '/bin', TERMINAL_TIMEOUT: '180' })
++  })
++
+   it('keeps a deliberate board pin when no worker marker is present', () => {
+     const env: NodeJS.ProcessEnv = { HERMES_KANBAN_BOARD: 'x', HERMES_KANBAN_DB: '/tmp/k.db' }
+ 
+diff --git a/apps/desktop/electron/leaked-worker-env.ts b/apps/desktop/electron/leaked-worker-env.ts
+index f200936d1c..d3aebe3e29 100644
+--- a/apps/desktop/electron/leaked-worker-env.ts
++++ b/apps/desktop/electron/leaked-worker-env.ts
+@@ -19,7 +19,9 @@ export const AGENT_SCOPE_EXACT_KEYS = [
+   'HERMES_DELEGATED_CHILD_CONTEXT',
+   'HERMES_SINGLE_QUERY_SESSION',
+   'HERMES_SPAWN',
+-  'HERMES_SUPERVISED_CHILD'
++  'HERMES_SUPERVISED_CHILD',
++  'TERMINAL_CWD',
++  'HERMES_UI_SESSION_ID'
+ ] as const
+ 
+ export const AGENT_SCOPE_PREFIXES = [
+@@ -28,7 +30,8 @@ export const AGENT_SCOPE_PREFIXES = [
+   'HERMES_CRON_',
+   'HERMES_PARENT_',
+   'HERMES_RPC_',
+-  'HERMES_KERNEL_'
++  'HERMES_KERNEL_',
++  'HERMES_BROWSER_CONTROL_'
+ ] as const
+ 
+ // Operator tunables sharing those prefixes are config, not identity: keep them.
+diff --git a/hermes_cli/kanban.py b/hermes_cli/kanban.py
+index a2c2607407..88a0d5c62c 100644
+--- a/hermes_cli/kanban.py
++++ b/hermes_cli/kanban.py
+@@ -151,7 +151,9 @@ def kanban_command(args: argparse.Namespace) -> int:
+     # Fast-fail for UX only; the durable trust boundary is in kanban_db, since children can
+     # import DB mutators directly.
+     if _is_delegated_child_cli_mutation(args):
+-        return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
++        from hermes_cli.top_level_env import delegated_child_refusal  # names a leaked worker env [daveey]
++        return _err(delegated_child_refusal(
++            "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI"))
+ 
+     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
+     # the `--board` routing override (else `--board beta boards show` reports beta).
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index 5d1dcd862c..267bbda241 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -148,7 +148,12 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
+     from agent.delegation_context import kanban_path_is_fenced
+ 
+     if kanban_path_is_fenced(kanban_home() if path is None else path):
+-        raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
++        msg = "delegate_task child contexts cannot mutate Kanban tasks or boards"
++        from agent.delegation_context import is_delegated_child_context
++        if not is_delegated_child_context():  # env-inherited fence: name a leaked worker env [daveey]
++            from hermes_cli.top_level_env import delegated_child_refusal
++            msg = delegated_child_refusal(msg)
++        raise PermissionError(msg)
+ 
+ 
+ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index a8aae5da67..480b95e883 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -13,11 +13,15 @@ these keys at launch, and code that reopens Desktop passes :func:`clean_launch_e
+ from __future__ import annotations
+ 
+ import os
+-from typing import MutableMapping, Optional, Sequence
++import re
++import subprocess
++from pathlib import Path
++from typing import Mapping, MutableMapping, Optional, Sequence
+ 
+ # The key family and the marker rule live in agent/delegation_context.py so they can't drift.
+ from agent.delegation_context import (
+     AGENT_SCOPE_MARKER_KEYS as WORKER_MARKER_KEYS,
++    DELEGATED_CHILD_ENV_MARKER,
+     strip_agent_scope_env,
+ )
+ 
+@@ -47,11 +51,145 @@ def scrub_for_top_level_launch(argv: Sequence[str]) -> list[str]:
+     """Scrub ``os.environ`` when ``argv`` (``sys.argv[1:]``) launches a top-level surface."""
+     if _first_positional(argv) not in TOP_LEVEL_COMMANDS:
+         return []
++    # Name the dead lineage while the pins still exist (the scrub removes them). [daveey]
++    diagnosis = leaked_worker_env_diagnosis() if os.environ.get(DELEGATED_CHILD_ENV_MARKER) else None
+     removed = scrub_leaked_worker_env()
+     if removed:
+         import logging
+ 
+         logging.getLogger(__name__).warning(
+-            "hermes %s: dropped inherited agent-scope env %s (launched from a kanban worker/delegate child)",
+-            _first_positional(argv), ", ".join(removed))
++            "hermes %s: dropped inherited agent-scope env %s (launched from a kanban worker/delegate child)%s",
++            _first_positional(argv), ", ".join(removed), f"; {diagnosis}" if diagnosis else "")
+     return removed
++
++
++# ── detection: a delegation marker with no live parent agent ─────────────────────────────────
++
++_TASK_ID_RE = re.compile(r"^t_[0-9a-f]{6,}$")
++
++
++def _lineage_task_id(env: Mapping[str, str]) -> str:
++    """The worker task this env descends from: ``HERMES_KANBAN_TASK``, else the workspace dir name
++    (a delegate child's subprocess env keeps the workspace but drops the task id)."""
++    tid = (env.get("HERMES_KANBAN_TASK") or "").strip()
++    if tid:
++        return tid
++    name = Path((env.get("HERMES_KANBAN_WORKSPACE") or "").strip() or "/").name
++    return name if _TASK_ID_RE.match(name) else ""
++
++
++def _board_db(env: Mapping[str, str]) -> Optional[Path]:
++    pinned = (env.get("HERMES_KANBAN_DB") or "").strip()
++    if pinned:
++        return Path(pinned).expanduser()
++    try:
++        from hermes_cli.kanban_db import kanban_db_path
++        return kanban_db_path()
++    except Exception:
++        return None
++
++
++def _task_state(db: Path, task_id: str) -> Optional[tuple[str, Optional[int]]]:
++    """``(status, worker_pid)`` of ``task_id``; ``("", None)`` when absent; ``None`` when unreadable."""
++    import sqlite3
++
++    if not db.is_file():
++        return None
++    try:
++        try:
++            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
++            conn.execute("select 1 from sqlite_master limit 1")
++        except sqlite3.OperationalError:  # WAL db with no -wal/-shm present: rw + query_only
++            conn = sqlite3.connect(f"file:{db}?mode=rw", uri=True, timeout=2)
++            conn.execute("PRAGMA query_only=ON")
++        try:
++            row = conn.execute("SELECT status, worker_pid FROM tasks WHERE id = ?", (task_id,)).fetchone()
++        finally:
++            conn.close()
++    except sqlite3.Error:
++        return None
++    if row is None:
++        return ("", None)
++    return (str(row[0] or ""), int(row[1]) if row[1] else None)
++
++
++def _pid_alive(pid: int) -> bool:
++    try:
++        os.kill(pid, 0)
++    except ProcessLookupError:
++        return False
++    except (PermissionError, OSError):
++        return True
++    return True
++
++
++def _parent_pid(pid: int) -> Optional[int]:
++    try:
++        import psutil
++        return int(psutil.Process(pid).ppid())
++    except ImportError:
++        pass
++    except Exception:
++        return None
++    try:
++        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
++                             timeout=5, check=False).stdout.strip()
++        return int(out) if out else None
++    except (OSError, ValueError, subprocess.SubprocessError):
++        return None
++
++
++def _is_ancestor(pid: int, start: Optional[int] = None) -> bool:
++    current = os.getpid() if start is None else start
++    for _ in range(64):
++        if current == pid:
++            return True
++        parent = _parent_pid(current)
++        if not parent or parent == current or parent <= 1:
++            return pid == parent
++        current = parent
++    return False
++
++
++def leaked_worker_env_diagnosis(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:
++    """Why this process's ``HERMES_DELEGATED_CHILD_CONTEXT`` looks leaked, or ``None``.
++
++    A real delegate child (or a worker's tool subprocess) descends from a live worker whose card is
++    ``running``. A marker whose worker card is finished, whose worker pid is gone, or which this
++    process does not descend from was inherited by a launch from inside a worker. Conservative:
++    ``None`` whenever the lineage task can't be identified or the board can't be read.
++    """
++    env = os.environ if environ is None else environ
++    if not env.get(DELEGATED_CHILD_ENV_MARKER):
++        return None
++    tid = _lineage_task_id(env)
++    if not tid:
++        return None
++    db = _board_db(env)
++    state = _task_state(db, tid) if db is not None else None
++    if state is None:
++        return None
++    status, worker_pid = state
++    if not status:
++        reason = f"its worker card {tid} is not on the board"
++    elif status != "running":
++        reason = f"its worker card {tid} is {status}"
++    elif worker_pid and not _pid_alive(worker_pid):
++        reason = f"{tid}'s worker pid {worker_pid} is gone"
++    elif worker_pid and not _is_ancestor(worker_pid):
++        reason = f"pid {os.getpid()} does not descend from {tid}'s worker pid {worker_pid}"
++    else:
++        return None
++    return (f"leaked worker env: this process inherited {DELEGATED_CHILD_ENV_MARKER} from kanban card {tid} "
++            f"but no parent agent is alive ({reason}). It is not a real delegate_task child: it was "
++            "launched from inside a worker (e.g. a worker's `hermes update` reopening Hermes Desktop). "
++            "Quit and reopen it (Hermes Desktop: Cmd-Q, then open the app) to restore Kanban writes.")
++
++
++def delegated_child_refusal(base: str) -> str:
++    """``base`` refusal text, plus the leak diagnosis when the fence comes from a leaked env."""
++    try:
++        diagnosis = leaked_worker_env_diagnosis()
++    except Exception:
++        diagnosis = None
++    return f"{base}. {diagnosis}" if diagnosis else base
+diff --git a/tests/hermes_cli/test_leaked_worker_env.py b/tests/hermes_cli/test_leaked_worker_env.py
+new file mode 100644
+index 0000000000..91f8ebaecf
+--- /dev/null
++++ b/tests/hermes_cli/test_leaked_worker_env.py
+@@ -0,0 +1,218 @@
++"""Leaked kanban-worker env in top-level launches (Hermes.app pid 59331, 2026-10-21). [daveey]
++
++A worker's ``hermes update`` reopened Hermes Desktop with the worker's env: the delegation marker,
++the kanban pins AND the worker's session identity (HERMES_SESSION_ID, HERMES_SESSION_SOURCE=kanban,
++HERMES_SINGLE_QUERY_SESSION=1, TERMINAL_CWD=<worker workspace>). Every Desktop chat then refused
++Kanban writes with an error that never said why.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sqlite3
++import subprocess
++import sys
++
++import pytest
++
++from hermes_cli import top_level_env as tle
++
++MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
++
++# Exactly the HERMES_* identity keys pid 59331 carried (minus config-derived TERMINAL_* exports).
++PID_59331 = {
++    MARKER: "/Users/x/.hermes",
++    "HERMES_SESSION_ID": "20261021_185223_3c48bc",
++    "HERMES_SESSION_SOURCE": "kanban",
++    "HERMES_SINGLE_QUERY_SESSION": "1",
++    "HERMES_KANBAN_BOARD": "default",
++    "HERMES_KANBAN_DB": "/Users/x/.hermes/kanban.db",
++    "HERMES_KANBAN_WORKSPACE": "/Users/x/.hermes/kanban/workspaces/t_45d5a361",
++    "HERMES_KANBAN_WORKSPACES_ROOT": "/Users/x/.hermes/kanban/workspaces",
++    "TERMINAL_CWD": "/Users/x/.hermes/kanban/workspaces/t_45d5a361",
++}
++KEEP = {"PATH": "/bin", "HERMES_HOME": "/Users/x/.hermes", "HERMES_PROFILE": "default"}
++
++
++# ── scrub: keys the shared agent-scope list (9778500b6b) still missed ──────────────────────
++
++def test_scrub_drops_every_identity_key_pid_59331_carried():
++    env = {**KEEP, **PID_59331, "TERMINAL_TIMEOUT": "180"}
++    tle.scrub_leaked_worker_env(env)
++    assert env == {**KEEP, "TERMINAL_TIMEOUT": "180"}
++
++
++def test_scrub_keeps_terminal_cwd_without_a_worker_marker():
++    env = {"TERMINAL_CWD": "/tmp", "HERMES_UI_SESSION_ID": "u"}
++    assert tle.scrub_leaked_worker_env(env) == []
++    assert env == {"TERMINAL_CWD": "/tmp", "HERMES_UI_SESSION_ID": "u"}
++
++
++def test_agent_scope_covers_gateway_session_context():
++    """Every per-session routing var the gateway binds is worker identity when inherited."""
++    from agent.delegation_context import is_agent_scope_env_key
++    from gateway.session_context import _VAR_MAP
++    assert [k for k in _VAR_MAP if not is_agent_scope_env_key(k)] == []
++
++
++def test_desktop_relaunch_after_update_drops_session_identity(monkeypatch, tmp_path):
++    """Launch path 1: ``hermes update``'s post-rebuild reopen (``_relaunch_stopped_desktops``)."""
++    from hermes_cli import main_desktop as md
++    for k, v in PID_59331.items():
++        monkeypatch.setenv(k, v)
++    exe = tmp_path / "Hermes.app" / "Contents" / "MacOS" / "Hermes"
++    exe.parent.mkdir(parents=True)
++    exe.write_text("")
++    monkeypatch.setattr(md, "_desktop_packaged_executable", lambda d: exe)
++    monkeypatch.setattr(md, "_desktop_relaunch_after_rebuild_enabled", lambda: True)
++    monkeypatch.setattr(md.sys, "platform", "darwin")
++    calls = []
++    monkeypatch.setattr(md.subprocess, "Popen", lambda cmd, **kw: calls.append((cmd, kw)))
++    md._relaunch_stopped_desktops(tmp_path, [[]])
++    env = calls[0][1]["env"]
++    assert not (set(PID_59331) & set(env))
++
++
++@pytest.mark.parametrize("command", ["serve", "dashboard", "desktop", "gateway", "gui"])
++def test_main_entry_scrubs_session_identity_for_every_top_level_surface(command):
++    """Launch path 2: ``hermes <surface>`` started from a worker shell (real subprocess, real main())."""
++    probe = (f"import os, sys, json; sys.argv=['hermes', {command!r}]; "
++             "from hermes_cli.top_level_env import scrub_for_top_level_launch as s; "
++             f"s(sys.argv[1:]); print(json.dumps(sorted(k for k in {sorted(PID_59331)!r} if k in os.environ)))")
++    env = {**os.environ, **PID_59331}
++    env["PYTHONPATH"] = os.pathsep.join(filter(None, [os.getcwd(), env.get("PYTHONPATH", "")]))
++    out = subprocess.run([sys.executable, "-c", probe], env=env, capture_output=True, text=True,
++                         timeout=60, check=True)
++    assert json.loads(out.stdout.strip().splitlines()[-1]) == []
++    assert "dropped inherited agent-scope env" in out.stderr
++
++
++# ── detection: a delegation marker with no live parent agent ─────────────────────────────────
++
++def _board(tmp_path, rows):
++    db = tmp_path / "kanban.db"
++    conn = sqlite3.connect(db)
++    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT, worker_pid INTEGER)")
++    conn.executemany("INSERT INTO tasks VALUES (?, ?, ?)", rows)
++    conn.commit()
++    conn.close()
++    return db
++
++
++def _leak_env(db, task="t_45d5a361"):
++    return {MARKER: str(db.parent), "HERMES_KANBAN_DB": str(db),
++            "HERMES_KANBAN_WORKSPACE": f"/w/kanban/workspaces/{task}"}
++
++
++def test_diagnosis_names_a_finished_worker_card(tmp_path):
++    db = _board(tmp_path, [("t_45d5a361", "done", 99999999)])
++    msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++    assert msg and "leaked worker env" in msg and "t_45d5a361" in msg and "is done" in msg
++    assert "reopen" in msg
++
++
++def test_diagnosis_names_a_dead_worker_pid(tmp_path):
++    p = subprocess.Popen([sys.executable, "-c", "pass"])
++    p.wait()
++    db = _board(tmp_path, [("t_45d5a361", "running", p.pid)])
++    msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++    assert msg and f"worker pid {p.pid} is gone" in msg
++
++
++def test_diagnosis_flags_a_live_worker_this_process_does_not_descend_from(tmp_path):
++    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
++    try:
++        db = _board(tmp_path, [("t_45d5a361", "running", p.pid)])
++        msg = tle.leaked_worker_env_diagnosis(_leak_env(db))
++        assert msg and "does not descend from" in msg
++    finally:
++        p.kill()
++        p.wait()
++
++
++def test_no_diagnosis_for_a_real_child_of_a_live_worker(tmp_path):
++    """The worker is this process's own ancestor (here: this process): a real delegate child."""
++    for i, pid in enumerate((os.getppid(), os.getpid())):
++        (tmp_path / str(i)).mkdir()
++        db = _board(tmp_path / str(i), [("t_45d5a361", "running", pid)])
++        assert tle.leaked_worker_env_diagnosis(_leak_env(db)) is None
++
++
++def test_backend_startup_warning_names_the_dead_lineage(monkeypatch, tmp_path, caplog):
++    """Detection at launch: ``hermes serve`` started with a marker whose worker is gone logs why."""
++    db = _board(tmp_path, [("t_45d5a361", "done", None)])
++    for k, v in _leak_env(db).items():
++        monkeypatch.setenv(k, v)
++    with caplog.at_level("WARNING", logger="hermes_cli.top_level_env"):
++        tle.scrub_for_top_level_launch(["serve"])
++    assert "leaked worker env" in caplog.text and "t_45d5a361 is done" in caplog.text
++    assert MARKER not in os.environ
++
++
++@pytest.mark.parametrize("env_patch", [
++    {MARKER: ""},                                       # no marker at all
++    {"HERMES_KANBAN_WORKSPACE": "/tmp/not-a-task"},     # lineage task unknown
++    {"HERMES_KANBAN_DB": "/nonexistent/kanban.db"},     # board unreadable
++])
++def test_diagnosis_is_conservative(tmp_path, env_patch):
++    db = _board(tmp_path, [("t_45d5a361", "done", None)])
++    assert tle.leaked_worker_env_diagnosis({**_leak_env(db), **env_patch}) is None
++
++
++# ── refusal surfaces name the leak ───────────────────────────────────────────────────────────
++
++@pytest.fixture
++def leaked_desktop(monkeypatch, tmp_path):
++    """A process shaped like pid 59331's backend: marker + pins of a finished card, real board."""
++    home = tmp_path / ".hermes"
++    home.mkdir()
++    monkeypatch.setenv("HERMES_HOME", str(home))
++    for k in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_RUN_ID"):
++        monkeypatch.delenv(k, raising=False)
++    from hermes_cli import kanban_db as kb
++    from hermes_cli import kanban_db_connect as kbc
++    kb._INITIALIZED_PATHS.clear()
++    kb.init_db()
++    conn = kbc.connect()
++    try:
++        tid = kb.create_task(conn, title="old worker", assignee="default")
++        kb.claim_task(conn, tid)
++        kb.complete_task(conn, tid, summary="done")
++        other = kb.create_task(conn, title="orchestrator wants to close this", assignee="default")
++    finally:
++        conn.close()
++    monkeypatch.setenv(MARKER, str(home))
++    monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(home / "kanban" / "workspaces" / tid))
++    return kb, kbc, tid, other
++
++
++def test_db_fence_names_the_leak(leaked_desktop):
++    kb, kbc, tid, other = leaked_desktop
++    conn = kbc.connect()
++    try:
++        with pytest.raises(PermissionError) as exc:
++            kb.complete_task(conn, other, summary="x")
++    finally:
++        conn.close()
++    assert "cannot mutate Kanban" in str(exc.value)
++    assert "leaked worker env" in str(exc.value) and tid in str(exc.value)
++
++
++def test_tool_refusal_names_the_leak(leaked_desktop):
++    _kb, _kbc, tid, other = leaked_desktop
++    from tools import kanban_tools as kt
++    out = json.loads(kt._handle_comment({"task_id": other, "body": "hi"}))
++    text = json.dumps(out)
++    assert "not Kanban run owners" in text and "leaked worker env" in text and tid in text
++
++
++def test_cli_refusal_names_the_leak(leaked_desktop, capsys):
++    _kb, _kbc, tid, other = leaked_desktop
++    import argparse
++    from hermes_cli import kanban as kcli
++    rc = kcli.kanban_command(argparse.Namespace(kanban_action="archive", task_ids=[other], board=None))
++    err = capsys.readouterr()
++    assert rc != 0
++    text = err.err + err.out
++    assert "cannot mutate Kanban tasks via the CLI" in text and "leaked worker env" in text and tid in text
++
+diff --git a/tools/kanban_tools.py b/tools/kanban_tools.py
+index 966950a86e..a34c729961 100644
+--- a/tools/kanban_tools.py
++++ b/tools/kanban_tools.py
+@@ -224,10 +224,15 @@ def _reject_delegated_child_mutation(tool_name: str) -> None:
+     """A delegate_task child shares the parent's process, so inherited HERMES_KANBAN_*
+     env is not proof of ownership: it may report findings but must not mutate."""
+     if _delegation_ctx("is_delegated_child_process_context", False):
+-        raise _Reject(
+-            f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
+-            "Return findings to the parent agent; the dispatcher worker or an explicitly "
+-            "configured Kanban orchestrator must perform board mutations.")
++        msg = (f"{tool_name} refused: delegate_task child agents are not Kanban run owners. "
++               "Return findings to the parent agent; the dispatcher worker or an explicitly "
++               "configured Kanban orchestrator must perform board mutations")
++        if not _is_delegated_child_context():
++            # Fenced by an inherited env marker, not an in-process child: a leaked worker env
++            # (a Desktop reopened from a worker) must say so instead. [daveey]
++            from hermes_cli.top_level_env import delegated_child_refusal
++            msg = delegated_child_refusal(msg)
++        raise _Reject(msg if msg.endswith(".") else msg + ".")
+ 
+ 
+ def _default_task_id(arg: Any) -> Optional[str]:
+-- 
+2.55.0
+

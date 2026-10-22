@@ -21,10 +21,20 @@ machine can verify.
 
 "What's blocked?" / "what do you need from me?" means **this chat's cards** (the ones it created or is
 subscribed to — its task strip), not every board. Find them from this session's own `kanban_create` results /
-task strip, then `kanban_show` each and report the blocked ones. Re-read each card (`kanban_show`: status, latest comments) right before presenting an ask. The user often
+task strip, then `kanban_show` each and report the blocked ones. Also report two states that wait silently:
+- `triage` with a human `block_kind` (`needs_input`/`capability`): block-loop detection moved a repeatedly
+  re-blocked card there. It still waits on the user, and the latest `block_loop_detected` event holds the ask.
+  Filtering on `status='blocked'` alone (as the digest script does) misses these.
+- `scheduled` cards whose wake time has passed, or that have no wake time at all (no `wake_at` on the
+  latest `continued`/`scheduled` event, or a wake cron that no longer exists): they sit unrun
+  indefinitely. Re-queue with `hermes kanban unblock <id>` (it accepts scheduled cards). A `needs_input`
+  card parked in scheduled is an ask of the user; report it.
+Re-read each card (`kanban_show`: status, latest comments) right before presenting an ask. The user often
 answers from the Desktop board (a comment by `desktop`), and the worker resumes on its own, so a question
 relayed from an earlier notification may already be stale. When relaying the user's answer to a blocked card,
-post it as a `kanban_comment`, then `kanban_unblock`, then read the status back. Go global (the digest script below, all
+or when the user's step is done, post a `kanban_comment` saying what changed, re-queue the card yourself
+(`kanban_unblock`, or the CLI for triage), then read the status back. Don't wait for the card to notice.
+Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
 say it's a global view.
 

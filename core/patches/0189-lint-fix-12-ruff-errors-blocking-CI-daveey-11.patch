@@ -1,0 +1,130 @@
+From d70ca5a9e77f6dc908e78c20525dd932d15a5667 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 04:35:01 -0700
+Subject: [PATCH] lint: fix 12 ruff errors blocking CI [daveey] (#11)
+
+* lint: fix 12 ruff errors blocking CI [daveey]
+
+PLW1510 check=False on 3 subprocess.run, RUF059 unused unpacks, PLR0402 from-imports, PIE807 dict over lambda.
+
+* tests: keep fork binding used by fork_merge_upstream asserts [daveey]
+---
+ hermes_cli/update_cmd_git.py                        | 4 ++--
+ tests/hermes_cli/test_desktop_swap_relaunch.py      | 4 ++--
+ tests/hermes_cli/test_git_pack_tidy.py              | 2 +-
+ tests/hermes_cli/test_update_fork_merge_upstream.py | 6 +++---
+ tests/tui_gateway/test_startup_resume.py            | 4 ++--
+ tui_gateway/startup_resume.py                       | 2 +-
+ 6 files changed, 11 insertions(+), 11 deletions(-)
+
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 1493100a35..fd81cb20a3 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -380,11 +380,11 @@ def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) ->
+         print("  ✗ Could not resolve HEAD. Skipping upstream merge.")
+         return None
+     tree_proc = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--no-messages", head, upstream],
+-                               cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
++                               cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+     tree = (tree_proc.stdout or "").split("\n", 1)[0].strip()
+     if tree_proc.returncode != 0 or not tree:
+         conflicts = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--name-only", "--no-messages", head, upstream],
+-                                   cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.splitlines()[1:]
++                                   cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False).stdout.splitlines()[1:]
+         print("  ✗ Upstream does not merge cleanly into your fork — nothing changed.\n"
+               "    Conflicting paths: " + (", ".join(p for p in conflicts if p.strip())[:400] or "?") + "\n"
+               "    Resolve by hand: git merge upstream/main, fix, commit, git push origin main")
+diff --git a/tests/hermes_cli/test_desktop_swap_relaunch.py b/tests/hermes_cli/test_desktop_swap_relaunch.py
+index f7b4f022cb..8a737ba3f0 100644
+--- a/tests/hermes_cli/test_desktop_swap_relaunch.py
++++ b/tests/hermes_cli/test_desktop_swap_relaunch.py
+@@ -62,7 +62,7 @@ def test_stopped_desktop_is_reopened_from_the_new_bundle(swap):
+ 
+ 
+ def test_launch_args_are_preserved(swap):
+-    desktop_dir, staging, live_exe, state = swap
++    desktop_dir, staging, _live_exe, state = swap
+     state["launches"] = {101: ["--hermes-flag"]}
+ 
+     main_desktop._swap_staged_desktop_app(desktop_dir, staging)
+@@ -83,7 +83,7 @@ def test_setting_off_keeps_upstream_behaviour(swap):
+ 
+ def test_desktop_not_stopped_is_not_reopened(swap):
+     """An ancestor Desktop (in-app update) is spared by the stop, so it is not in `stopped`."""
+-    desktop_dir, staging, live_exe, state = swap
++    desktop_dir, staging, _live_exe, state = swap
+     state["launches"] = {101: []}
+     state["stopped"] = []
+ 
+diff --git a/tests/hermes_cli/test_git_pack_tidy.py b/tests/hermes_cli/test_git_pack_tidy.py
+index 611b8dd1fd..77b4fee110 100644
+--- a/tests/hermes_cli/test_git_pack_tidy.py
++++ b/tests/hermes_cli/test_git_pack_tidy.py
+@@ -151,7 +151,7 @@ tidy.tidy_partial_clone_packs(Path(sys.argv[1]))
+ 
+ def _git_supports_incremental_midx() -> bool:
+     """`multi-pack-index write --incremental` arrived in git 2.47; older runners exit 129 (usage)."""
+-    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
++    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=False).stdout
+     m = re.search(r"(\d+)\.(\d+)", out)
+     return bool(m) and (int(m[1]), int(m[2])) >= (2, 47)
+ 
+diff --git a/tests/hermes_cli/test_update_fork_merge_upstream.py b/tests/hermes_cli/test_update_fork_merge_upstream.py
+index 63032a5bce..f86de08195 100644
+--- a/tests/hermes_cli/test_update_fork_merge_upstream.py
++++ b/tests/hermes_cli/test_update_fork_merge_upstream.py
+@@ -33,13 +33,13 @@ def run(live, merge_flag, upstream_edit):
+ 
+ 
+ def test_flag_off_leaves_fork_untouched(tmp_path):
+-    up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++    _up, _fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert run(live, False, ("b.txt", "b up\n"))
+     assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
+ 
+ 
+ def test_flag_on_merges_upstream_and_pushes(tmp_path):
+-    up, fork, live = mkrepo(tmp_path)
++    _up, fork, live = mkrepo(tmp_path)
+     assert run(live, True, ("b.txt", "b up\n"))
+     head = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert (live / "a.txt").read_text() == "a fork\n" and (live / "b.txt").read_text() == "b up\n"
+@@ -49,7 +49,7 @@ def test_flag_on_merges_upstream_and_pushes(tmp_path):
+ 
+ 
+ def test_conflict_moves_nothing(tmp_path):
+-    up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
++    _up, fork, live = mkrepo(tmp_path); pre = sh("git", "rev-parse", "HEAD", cwd=live)
+     assert not run(live, True, ("a.txt", "a upstream conflict\n"))
+     assert sh("git", "rev-parse", "HEAD", cwd=live) == pre
+     assert sh("git", "rev-parse", "main", cwd=fork) == pre
+diff --git a/tests/tui_gateway/test_startup_resume.py b/tests/tui_gateway/test_startup_resume.py
+index b9f4575635..78a7dee862 100644
+--- a/tests/tui_gateway/test_startup_resume.py
++++ b/tests/tui_gateway/test_startup_resume.py
+@@ -75,6 +75,6 @@ def test_one_failure_does_not_stop_the_sweep(tmp_path):
+ 
+ 
+ def test_start_is_noop_when_disabled(monkeypatch):
+-    import hermes_cli.config as config
+-    monkeypatch.setattr(config, "load_config", lambda: {})
++    from hermes_cli import config
++    monkeypatch.setattr(config, "load_config", dict)
+     assert sr.start_startup_resume_sweep() is None
+diff --git a/tui_gateway/startup_resume.py b/tui_gateway/startup_resume.py
+index f6f4e8bcd1..a1d99ac0b9 100644
+--- a/tui_gateway/startup_resume.py
++++ b/tui_gateway/startup_resume.py
+@@ -118,7 +118,7 @@ def start_startup_resume_sweep() -> threading.Thread | None:
+     def _run() -> None:
+         time.sleep(delay)
+         try:
+-            import tui_gateway.server as server
++            from tui_gateway import server
+             handler = server._methods.get("session.resume")
+             if handler is None:
+                 logger.warning("startup resume: session.resume handler not installed")
+-- 
+2.55.0
+

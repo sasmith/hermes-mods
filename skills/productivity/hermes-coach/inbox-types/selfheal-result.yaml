@@ -1,0 +1,13 @@
+name: selfheal-result
+label: Self-heal result
+fields:
+  fp: {required: true}
+actions:
+  - {id: ok, label: OK, icon: check, style: primary, kind: resolve}
+  - id: undo
+    label: Undo
+    icon: discard
+    kind: task
+    title: "self-heal undo: {{fp}}"
+    confirm: Revert this fix now?
+    prompt: "Undo the self-heal fix for defect {{fp}}: follow the Undo line of this Inbox card's body (the fix card selfheal:{{fp}}:fix lists the commits), revert them through the normal ship path, verify the revert live, then run `python3 ~/code/hermes-mods/plugins/coach/self_heal.py event reverted {{fp}} --card $HERMES_KANBAN_TASK` and complete with what you reverted."

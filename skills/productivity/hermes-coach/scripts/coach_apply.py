@@ -405,6 +405,20 @@ def _when_pt(at):
         return ""
 
 
+def _ro_connect(path, timeout=10):
+    """Read-only open. mode=ro fails on a WAL db while its -wal/-shm is absent (writers delete them on last close),
+    so fall back to mode=rw + query_only, which reads the same data and never writes rows."""
+    import sqlite3
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=timeout)
+        c.execute("select 1 from sqlite_master limit 1")
+        return c
+    except sqlite3.OperationalError:
+        c = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=timeout)
+        c.execute("PRAGMA query_only=ON")
+        return c
+
+
 def _evidence_source(env, evidence):
     """First evidence session as a link chip when it lives on this host, else its title; '' if none."""
     m = re.match(r"\s*([\w.-]+)/([\w.-]+)/(\d{8}_\d{6}_[0-9a-f]+)\s+—\s+([^:]+)", str(evidence or ""))
@@ -414,7 +428,7 @@ def _evidence_source(env, evidence):
     db = env.home / ("state.db" if prof == "default" else f"profiles/{prof}/state.db")
     try:
         import sqlite3
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        con = _ro_connect(db, timeout=5)
         try:
             if con.execute("select 1 from sessions where id=?", (sid,)).fetchone():
                 return f"@session:{prof}/{sid}"

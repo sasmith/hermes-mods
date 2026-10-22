@@ -1,0 +1,7 @@
+{"ts": "2026-10-22T06:15:35.781808+00:00", "tag": "asyncio.run.returned", "level": "info", "pid": 100, "success": true}
+{"ts": "2026-10-22T06:15:35.795074+00:00", "tag": "gateway.exit_clean", "level": "info", "pid": 100}
+{"ts": "2026-10-22T06:15:40.472049+00:00", "tag": "gateway.start", "level": "info", "pid": 101, "argv": ["-c", "gateway", "run"]}
+{"ts": "2026-10-22T07:45:24.075325+00:00", "tag": "asyncio.run.SystemExit", "level": "info", "pid": 101, "code": 75}
+{"ts": "2026-10-22T07:46:55.362603+00:00", "tag": "gateway.start", "level": "info", "pid": 102, "argv": ["-c", "gateway", "run"]}
+{"ts": "2026-10-22T07:46:56.000000+00:00", "tag": "gateway.previous_unclean_exit", "level": "warning", "pid": 102, "previous_pid": 101, "suspected_oom": true, "state_db_integrity": "ok"}
+{"ts": "2026-10-22T08:30:00.000000+00:00", "tag": "asyncio.run.exception", "level": "error", "pid": 102, "exc_type": "RuntimeError", "exc_repr": "RuntimeError('event loop is closed')", "traceback": "Traceback ..."}

@@ -1,0 +1,93 @@
+From 928c7278cc19912cd29d1d2184531b99ee794b8b Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 06:48:49 +0000
+Subject: [PATCH] fix: subprocess text=True needs encoding
+ utf-8/errors=replace; psutil pid check (Windows footguns) (#13)
+
+---
+ hermes_cli/kanban_host_identity.py    |  2 +-
+ hermes_cli/review_session_activity.py |  2 +-
+ hermes_cli/top_level_env.py           | 10 ++++++++--
+ hermes_cli/update_cmd_git.py          |  4 ++--
+ 4 files changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/hermes_cli/kanban_host_identity.py b/hermes_cli/kanban_host_identity.py
+index ff6bdca4e7..df97671395 100644
+--- a/hermes_cli/kanban_host_identity.py
++++ b/hermes_cli/kanban_host_identity.py
+@@ -26,7 +26,7 @@ def boot_prefix() -> str | None:
+     try:
+         result = subprocess.run(
+             ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+-            capture_output=True, text=True, timeout=2, check=True,
++            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=2, check=True,
+         )
+         return f"boot-{uuid.UUID(result.stdout.strip())}:"
+     except (OSError, ValueError, subprocess.SubprocessError):
+diff --git a/hermes_cli/review_session_activity.py b/hermes_cli/review_session_activity.py
+index 98ad9cdefe..b1976418db 100644
+--- a/hermes_cli/review_session_activity.py
++++ b/hermes_cli/review_session_activity.py
+@@ -160,7 +160,7 @@ def _fetch_pr(key: tuple[str, str, int]) -> dict[str, Any] | None:
+     proc = subprocess.run(
+         [gh, "api", "graphql", "-F", f"o={owner}", "-F", f"r={repo}", "-F", f"n={number}",
+          "-f", f"query={_QUERY}"],
+-        capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL, check=False,
++        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20, stdin=subprocess.DEVNULL, check=False,
+     )
+     if proc.returncode != 0:
+         raise RuntimeError(proc.stderr.strip()[:200])
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index 480b95e883..335767717b 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -115,12 +115,18 @@ def _task_state(db: Path, task_id: str) -> Optional[tuple[str, Optional[int]]]:
+ 
+ def _pid_alive(pid: int) -> bool:
+     try:
+-        os.kill(pid, 0)
++        import psutil
++        return bool(psutil.pid_exists(pid))
++    except ImportError:
++        pass
++    try:
++        os.kill(pid, 0)  # windows-footgun: ok (psutil-less POSIX fallback)
+     except ProcessLookupError:
+         return False
+     except (PermissionError, OSError):
+         return True
+     return True
++    return True
+ 
+ 
+ def _parent_pid(pid: int) -> Optional[int]:
+@@ -132,7 +138,7 @@ def _parent_pid(pid: int) -> Optional[int]:
+     except Exception:
+         return None
+     try:
+-        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True,
++        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=5, check=False).stdout.strip()
+         return int(out) if out else None
+     except (OSError, ValueError, subprocess.SubprocessError):
+diff --git a/hermes_cli/update_cmd_git.py b/hermes_cli/update_cmd_git.py
+index 192b8c65b5..1493100a35 100644
+--- a/hermes_cli/update_cmd_git.py
++++ b/hermes_cli/update_cmd_git.py
+@@ -380,11 +380,11 @@ def _synthesize_upstream_merge(git_cmd: list[str], cwd: Path, upstream: str) ->
+         print("  ✗ Could not resolve HEAD. Skipping upstream merge.")
+         return None
+     tree_proc = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--no-messages", head, upstream],
+-                               cwd=cwd, capture_output=True, text=True)
++                               cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+     tree = (tree_proc.stdout or "").split("\n", 1)[0].strip()
+     if tree_proc.returncode != 0 or not tree:
+         conflicts = subprocess.run([*git_cmd, "merge-tree", "--write-tree", "--name-only", "--no-messages", head, upstream],
+-                                   cwd=cwd, capture_output=True, text=True).stdout.splitlines()[1:]
++                                   cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.splitlines()[1:]
+         print("  ✗ Upstream does not merge cleanly into your fork — nothing changed.\n"
+               "    Conflicting paths: " + (", ".join(p for p in conflicts if p.strip())[:400] or "?") + "\n"
+               "    Resolve by hand: git merge upstream/main, fix, commit, git push origin main")
+-- 
+2.54.0 (Apple Git-157)
+

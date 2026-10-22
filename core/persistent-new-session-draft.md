@@ -22,9 +22,17 @@ composer and leaves the earlier unsent text in an unreachable bucket.
 - Leaving the new-session screen already stashes the live editor text and attachments under the fresh
   key (the composer's scope-swap cleanup). Returning restores them from that bucket.
 
+## Dead-session prune (0170)
+
+The Desktop's dead-session prune probes each stored draft scope as a session id and clears it on a 404. It excluded
+only the legacy `__new__` bucket, so the per-lifecycle `__new__:<uuid>` key (where the unsent new-chat text sits after
+you switch away) was probed, 404'd, and the draft was deleted a few seconds later; ⌘N then rotated to a blank
+composer. `stashedDraftScopes()` (`store/composer.ts`) now excludes every fresh-draft scope (`isFreshDraftScope`).
+
 ## Code
 
 Patch 0036: `apps/desktop/src/store/composer.ts`, `apps/desktop/src/app/session/hooks/use-session-actions/index.ts`.
+Patch 0170: `apps/desktop/src/store/composer.ts` (`stashedDraftScopes`).
 
 ## Tests
 
@@ -32,9 +40,12 @@ Patch 0036: `apps/desktop/src/store/composer.ts`, `apps/desktop/src/app/session/
 of rotating it away". It fails without the patch. The existing #66662 isolation tests still pass,
 because they rotate keys that are empty.
 
+0170: `store/dead-session-prune.test.ts` "never discards a per-lifecycle new-chat draft (__new__:<uuid>)" (also asserts
+`getSession` is not called with the fresh key, and that a real dead session's draft is still pruned).
+
 ## Applying
 
-Applies on its own: `git am -3 core/patches/0036-*.patch`, then rebuild the desktop app.
+Applies on its own: `git am -3 core/patches/0036-*.patch` (0170 after it), then rebuild the desktop app.
 
 ## Gotchas
 

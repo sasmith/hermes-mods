@@ -37,9 +37,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import coach_fixer as fx  # noqa: E402
 
-CAPS = {"scout": 3.0, "fixer": 7.0, "trial": 10.0}
+CAPS = {"scout": 3.0, "fixer": 7.0, "trial": 10.0, "selfheal": 25.0}
 TOTAL_USD_DAY = 20.0
-LANES = ("scout", "fixer", "trial", "bot")
+LANES = ("scout", "fixer", "trial", "bot", "selfheal")
+# Lanes with their own approved daily cap that do not count toward (or stop at) the engine total: self-heal
+# ($25/UTC day, plugins/coach/self_heal.py, approved separately from the $20 engine budget).
+SEPARATE = ("selfheal",)
+LIVE_LANES = ("fixer", "trial", "selfheal")
 HOME = Path.home()
 # "Budget for this card ≤ $8", "Budget ≤ $4", "budget: $5" (never the fixer body's "Budget: this card runs at most…")
 CARD_BUDGET_RX = re.compile(r"(?i)\bbudget(?: for this card)?\s*(?:≤|<=|<|:|is|of)?\s*\$\s*(\d+(?:\.\d+)?)")
@@ -97,7 +101,7 @@ def snapshot(home=None, board=None, data=None, now=None, live=True, by_lane=None
     cards, ev = {}, 0.0
     live_lanes = {}
     if live and fx.kanban_db(home, board).exists():
-        for lane in ("fixer", "trial"):
+        for lane in LIVE_LANES:
             bd = (by_lane or {}).get(lane)
             if bd is None or day not in bd:
                 bd = fx.spend_by_day(home, board, 1, now, lane=lane)
@@ -125,7 +129,8 @@ def snapshot(home=None, board=None, data=None, now=None, live=True, by_lane=None
             cards[t] = round(cards.get(t, 0.0) + u, 4)
     caps, total_cap = caps_for(data, day)
     lanes = {k: round(v, 4) for k, v in lanes.items()}
-    return {"day": day, "lanes": lanes, "eval": round(ev, 4), "cards": cards, "total": round(sum(lanes.values()), 4),
+    total = sum(v for k, v in lanes.items() if k not in SEPARATE)
+    return {"day": day, "lanes": lanes, "eval": round(ev, 4), "cards": cards, "total": round(total, 4),
             "caps": caps, "total_cap": total_cap, "live": bool(live_lanes)}
 
 
@@ -135,6 +140,8 @@ def check(snap, lane, extra=0.0):
     usd = snap["lanes"].get(lane, 0.0) + extra
     if cap is not None and usd >= cap:
         return False, f"{lane} lane spend today ${usd:.2f} >= ${cap:g} cap"
+    if lane in SEPARATE:
+        return True, ""
     tot = snap["total"] + extra
     if tot >= snap["total_cap"]:
         return False, f"engine total today ${tot:.2f} >= ${snap['total_cap']:g}/day cap ({lane_line(snap)})"
@@ -173,7 +180,7 @@ def engine_cards(home, board, statuses=("running",)):
         cols = {r[1] for r in k.execute("pragma table_info(tasks)")}
         pid = "t.worker_pid" if "worker_pid" in cols else "null"
         body = "coalesce(t.body, '')" if "body" in cols else "''"
-        for lane in ("fixer", "trial"):
+        for lane in LIVE_LANES:
             for r in k.execute(f"select t.id, t.title, t.status, {body}, {pid} from tasks t "
                                f"where t.status in ({q}) and {fx.LANE_WHERE[lane]}", statuses):
                 out.append({"id": r[0], "title": r[1], "status": r[2], "body": r[3], "worker_pid": r[4], "lane": lane})

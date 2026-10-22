@@ -1,0 +1,60 @@
+From a0daed9c90f2e173926b7fa83376650b31b3f9ff Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 01:09:46 -0700
+Subject: [PATCH] =?UTF-8?q?fix(windows):=20clear=20remaining=20footguns=20?=
+ =?UTF-8?q?=E2=80=94=20utf-8-sig=20read=20in=20cron=5Fsession=5Factivity,?=
+ =?UTF-8?q?=20binary=20flock=20file=20in=20process=5Fregistry=5Fcheckpoint?=
+ =?UTF-8?q?,=20drop=20dead=20return=20in=20=5Fpid=5Falive=20[daveey]=20(#2?=
+ =?UTF-8?q?0)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ hermes_cli/cron_session_activity.py  | 2 +-
+ hermes_cli/top_level_env.py          | 1 -
+ tools/process_registry_checkpoint.py | 3 ++-
+ 3 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/hermes_cli/cron_session_activity.py b/hermes_cli/cron_session_activity.py
+index 71e709d7fc..00c1c047e1 100644
+--- a/hermes_cli/cron_session_activity.py
++++ b/hermes_cli/cron_session_activity.py
+@@ -83,7 +83,7 @@ def _read_owners(path: Path) -> frozenset[str]:
+     hit = _file_cache.get(str(path))
+     if hit and hit[0] == stamp:
+         return hit[1]
+-    data = json.loads(path.read_text(encoding="utf-8") or "[]")
++    data = json.loads(path.read_text(encoding="utf-8-sig") or "[]")
+     jobs = data.get("jobs", []) if isinstance(data, dict) else data
+     owners = frozenset(owners_from_jobs(jobs if isinstance(jobs, list) else []))
+     _file_cache[str(path)] = (stamp, owners)
+diff --git a/hermes_cli/top_level_env.py b/hermes_cli/top_level_env.py
+index 335767717b..768bdd2406 100644
+--- a/hermes_cli/top_level_env.py
++++ b/hermes_cli/top_level_env.py
+@@ -126,7 +126,6 @@ def _pid_alive(pid: int) -> bool:
+     except (PermissionError, OSError):
+         return True
+     return True
+-    return True
+ 
+ 
+ def _parent_pid(pid: int) -> Optional[int]:
+diff --git a/tools/process_registry_checkpoint.py b/tools/process_registry_checkpoint.py
+index a92e47f7c1..4d392d2d14 100644
+--- a/tools/process_registry_checkpoint.py
++++ b/tools/process_registry_checkpoint.py
+@@ -43,7 +43,8 @@ class ProcessCheckpointMixin:
+         def _lock():
+             path = _checkpoint_path()
+             path.parent.mkdir(parents=True, exist_ok=True)
+-            with open(str(path) + ".lock", "a+") as fh:
++            lock_path = str(path) + ".lock"
++            with open(lock_path, "ab") as fh:  # flock-only; never read or written
+                 try:
+                     fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                 except OSError:
+-- 
+2.55.0
+

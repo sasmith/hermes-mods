@@ -1,16 +1,19 @@
-"""user-terminal — run a command in a real terminal window, after the user confirms it there.
+"""user-terminal — run a command in a real terminal window on the user's screen.
 
 Instead of telling the user "please run X in your terminal", the agent calls ``run_in_user_terminal``.
 The plugin opens a terminal window (iTerm if installed, else Terminal.app, else cmux), shows why the agent
-wants to run the command, the working directory and the exact command, and asks ``Run it? [y/N]``.
-On ``y`` the command runs right there, in a real TTY (so sudo passwords, OAuth device codes, interactive
+wants to run the command, the working directory and the exact command, and runs it right away (the user
+asked for no y/N step: they always said yes). Ctrl-C in the window cancels it. Config
+``user_terminal.confirm`` (env ``HERMES_USER_TERMINAL_CONFIRM``) = ``off`` (default) | ``remote`` (ask
+``Run it? [y/N]`` only for jobs relayed from another gateway) | ``all``. The command runs in a real TTY (so sudo passwords, OAuth device codes, interactive
 logins and TCC prompts all work, with the terminal's permissions). The tool waits for the outcome and
 returns the exit code plus the captured output to the agent.
 
 Jobs live in ``<hermes home>/cache/user-terminal/<job_id>/``:
   meta.json   reason / cwd / command (shown by the runner)
   cmd.sh      the command, verbatim
-  runner.sh   the confirm-and-run script the window executes
+  runner.sh   the show-and-run script the window executes
+  confirm     present -> the runner asks y/N first (see confirm_mode)
   output.log  everything printed while the command ran (via script(1))
   status.json {"status": "running"|"ran"|"declined", "exit_code": n}
 
@@ -25,7 +28,7 @@ the job to the owner's Mac through the session-mentions courier: it writes a ``u
 ``user_terminal.device``, env ``HERMES_USER_TERMINAL_DEVICE``, else the only live courier). That Mac's
 Desktop courier claims it and calls this plugin's own dashboard routes on the Mac's backend
 (``dashboard/plugin_api.py``: ``POST /start``, ``GET /status/<job>``), which run the local path above
-(``create_job`` + ``open_window`` + ``wait_for``). The confirm window names the originating
+(``create_job`` + ``open_window`` + ``wait_for``). The window names the originating
 gateway/profile/session. Only the owner's own sessions (desktop/cli/tui/api_server) may call it; a session
 on a messaging platform (e.g. Slack on a shared bot) is refused. No live courier for that Mac -> an
 immediate error, never a silent wait.
@@ -70,12 +73,13 @@ def jobs_dir() -> Path:
 SCHEMA = {
     "name": "run_in_user_terminal",
     "description": (
-        "Run a shell command in a terminal window on the user's screen, after the user confirms it IN "
-        "THAT TERMINAL. Use this whenever you would otherwise ask the user to run a command themselves "
+        "Run a shell command in a terminal window on the user's screen, where they can type passwords "
+        "and answer prompts. Use this whenever you would otherwise ask the user to run a command themselves "
         "— anything needing their password (sudo), an interactive login/OAuth/device code, a TTY prompt, "
-        "their terminal's macOS permissions, or that you are not allowed to run unattended. Never tell "
+        "or their terminal's macOS permissions. It is not an approval gate (no y/N): get a go-ahead in chat "
+        "first for anything destructive. Never tell "
         "the user to copy/paste a command; call this instead. The window shows `reason`, `cwd` and the "
-        "exact `command`, asks 'Run it? [y/N]', runs it on 'y', and this tool returns status "
+        "exact `command`, runs it right away (no y/N step; the user can Ctrl-C it), and this tool returns status "
         "(ran/declined/pending), exit_code and the output. The user can type into the window if the "
         "command prompts. If it is still pending after `wait_s`, call again with only `job_id` to keep waiting."
     ),
@@ -109,13 +113,17 @@ echo
 echo "${B}Command:${N}"
 printf '%s' "${Y}"; wrap < "$JOB/cmd_display.txt"; printf '%s' "${N}"
 echo
-while true; do
-  read -r -p "${B}Run it? [y/N]${N} " ans
-  case "$ans" in
-    y|Y|yes|YES) break ;;
-    ""|n|N|no|NO) status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
-  esac
-done
+if [ -f "$JOB/confirm" ]; then
+  while true; do
+    read -r -p "${B}Run it? [y/N]${N} " ans
+    case "$ans" in
+      y|Y|yes|YES) break ;;
+      ""|n|N|no|NO) status '{"status":"declined"}'; echo "${R}Declined — told Hermes.${N}"; sleep 2; exit 0 ;;
+    esac
+  done
+else
+  echo "${D}Running now. Ctrl-C cancels.${N}"
+fi
 echo "${D}──────────────────────────────────────────${N}"
 status '{"status":"running"}'
 cd "$(cat "$JOB/cwd.txt")" || { status '{"status":"ran","exit_code":1,"error":"cwd not found"}'; read -r -p "cwd not found. Enter to close. "; exit 1; }
@@ -272,7 +280,24 @@ def origin_lines(origin: dict | None) -> tuple[str, str]:
     return text + "\n", f"{gw}/{profile}"
 
 
-def create_job(command: str, reason: str, cwd: str, origin: dict | None = None) -> Path:
+def confirm_mode() -> str:
+    """off (default) | remote | all — when the runner asks ``Run it? [y/N]`` before running."""
+    mode = os.environ.get("HERMES_USER_TERMINAL_CONFIRM", "")
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+
+        v = ((load_config() or {}).get("user_terminal") or {}).get("confirm")
+        if v is not None and str(v).strip():
+            mode = "all" if v is True else "off" if v is False else str(v)
+    except Exception:
+        pass
+    mode = mode.strip().lower()
+    return {"1": "all", "true": "all", "yes": "all", "on": "all", "0": "off", "false": "off", "no": "off"}.get(
+        mode, mode if mode in ("off", "remote", "all") else "off")
+
+
+def create_job(command: str, reason: str, cwd: str, origin: dict | None = None,
+               confirm: bool | None = None) -> Path:
     job = jobs_dir() / (time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6])
     job.mkdir(parents=True)
     (job / "cmd.sh").write_text(command.rstrip("\n") + "\n")
@@ -285,6 +310,11 @@ def create_job(command: str, reason: str, cwd: str, origin: dict | None = None) 
     if full:
         (job / "origin.txt").write_text(full)
         (job / "origin_short.txt").write_text(short + "\n")
+    if confirm is None:
+        mode = confirm_mode()
+        confirm = mode == "all" or (mode == "remote" and bool(full))
+    if confirm:
+        (job / "confirm").write_text("1\n")
     (job / "runner.sh").write_text(RUNNER)
     (job / "status.json").write_text(json.dumps({"status": "waiting_for_user"}))
     (job / "meta.json").write_text(json.dumps({"command": command, "reason": reason, "cwd": cwd,
@@ -366,28 +396,57 @@ def handle(args: dict, **_kw: Any) -> str:
 
 
 # Output shapes that mean "this needs the user's TTY/password". Core appends a SUDO_PASSWORD tip to the
-# sudo ones, which steers the agent to tell the user to paste the command themselves. Plugin tools are
-# always deferred behind tool_search, so the agent may not even see run_in_user_terminal at that moment.
-_NEEDS_USER = (
-    "sudo: a password is required", "sudo: no tty present", "sudo: a terminal is required",
-)
+# sudo ones, which steers the agent to tell the user to paste the command themselves. Plugin tools may be
+# deferred behind tool_search, so the agent may not even see run_in_user_terminal at that moment.
+# Line-anchored so a log or a grep that merely contains the text doesn't fire. Nested ssh (laptop -> mini ->
+# host) prints the inner failure on its own line too, so it matches the same way.
+_NEEDS_SUDO = re.compile(r"^(?:sudo: (?:a password is required|no tty present|a terminal is required)|"
+                         r"sorry, you must have a tty to run sudo)", re.M)
+_NEEDS_SSH = re.compile(
+    r"^(?:[\w.-]+@[\w.\[\]:-]+: )?Permission denied \([^)\n]*(?:password|keyboard-interactive)[^)\n]*\)\.?\r?$|"
+    r"^Enter passphrase for key\b|^[\w.-]+@[\w.-]+'s password: ?$|^\(?[\w.-]+@[\w.-]+\)? ?Password: ?$|"
+    r"^(?:/usr/bin/)?ssh-copy-id: ERROR\b|^Too many authentication failures\b", re.M)
+_NEEDS_OTHER = re.compile(r"could not read (?:Username|Password) for 'https?://|User interaction is not allowed", re.M)
+_NEEDS_USER = ("sudo: a password is required", "sudo: no tty present", "sudo: a terminal is required")  # compat
 _CORE_SUDO_TIP = re.compile(r"\n*💡 Tip: (?:To enable sudo over messaging|This session cannot prompt for a sudo password)[^\n]*")
-HINT = ("\n\n💡 This needs the user's password/TTY. Do NOT ask the user to run it themselves and do NOT suggest "
-        "SUDO_PASSWORD. Call run_in_user_terminal instead (deferred tool: tool_call name=\"run_in_user_terminal\", "
-        "arguments {command, reason}). It opens a terminal on their screen, they confirm and type the password "
-        "there, and you get the exit code + output back. For a remote host, wrap it: ssh -t <host> 'sudo ...'.")
+_MARK = "💡 This needs the user's password/TTY."
+_HEAD = ("\n\n" + _MARK + " Do NOT ask the user to run it themselves, do NOT hand it back as a step for them, and do "
+         "NOT suggest SUDO_PASSWORD. Call run_in_user_terminal instead (tool_call name=\"run_in_user_terminal\", "
+         "arguments {command, reason}). It opens a terminal on their screen, they type any password "
+         "there, and you get the exit code + output back. ")
+HINT = _HEAD + "For a remote host, wrap it: ssh -t <host> 'sudo ...'."
+SSH_HINT = (_HEAD + "SSH refused key auth. Call run_in_user_terminal with `ssh-copy-id -i ~/.ssh/id_ed25519.pub "
+            "<user>@<host>` (or the ssh command itself); the user types the password there; then continue with key "
+            "auth. If the ssh ran on another host (a hop through the mini), wrap it: ssh -t <hop> 'ssh-copy-id "
+            "<user>@<host>' so the key that gets installed is the hop's.")
+OTHER_HINT = (_HEAD + "For git over HTTPS or a locked keychain, run the same command there (e.g. `git pull`, "
+              "`security unlock-keychain`) so the user can type the credential.")
+
+
+def needs_user(output: str) -> str | None:
+    """Which hint fits this terminal output, or None."""
+    if not isinstance(output, str) or _MARK in output:
+        return None
+    if _NEEDS_SUDO.search(output):
+        return HINT
+    if _NEEDS_SSH.search(output):
+        return SSH_HINT
+    if _NEEDS_OTHER.search(output):
+        return OTHER_HINT
+    return None
 
 
 def transform_terminal_output(command: str = "", output: str = "", **_: Any) -> str | None:
-    if not isinstance(output, str) or not any(s in output for s in _NEEDS_USER) or HINT in output:
+    hint = needs_user(output)
+    if hint is None:
         return None
-    return _CORE_SUDO_TIP.sub("", output).rstrip() + HINT
+    return _CORE_SUDO_TIP.sub("", output).rstrip() + hint
 
 
 # ---------------------------------------------------------------- relayed jobs (Mac side)
 
 def start_relayed(command: str, reason: str, cwd: str, origin: dict) -> dict:
-    """Open the confirm window for a job relayed from another gateway (dashboard ``POST /start``)."""
+    """Open the run window for a job relayed from another gateway (dashboard ``POST /start``)."""
     command = str(command or "").strip()
     if not command:
         return {"ok": False, "error": "command is required"}
@@ -447,6 +506,21 @@ def caller_surfaces(session_id: str | None) -> list[str]:
     return sorted({str(i).strip().lower() for i in ids if str(i or "").strip()})
 
 
+def _owner_slack_dm() -> bool:
+    """The session is the owner's own Slack DM with the bot (config owner.slack_user_ids; Slack-verified fields)."""
+    try:
+        from hermes_cli.config import load_config  # type: ignore
+        ids = (((load_config() or {}).get("owner") or {}).get("slack_user_ids")) or []
+    except Exception:
+        ids = []
+    if isinstance(ids, str):
+        ids = [x for x in re.split(r"[,\s]+", ids) if x]
+    return (_session_env("HERMES_SESSION_PLATFORM").lower() == "slack"
+            and _session_env("HERMES_SESSION_CHAT_TYPE").lower() in ("dm", "im")
+            and _session_env("HERMES_SESSION_CHAT_ID").startswith("D")
+            and _session_env("HERMES_SESSION_USER_ID") in {str(i) for i in ids})
+
+
 def owner_refusal(session_id: str | None) -> str | None:
     """None when the caller is the owner's own session; else the refusal text. Default-deny."""
     surfaces = caller_surfaces(session_id)
@@ -454,6 +528,13 @@ def owner_refusal(session_id: str | None) -> str | None:
     if surfaces and not others:
         return None
     where = ", ".join(others) or "an unknown surface"
+    if _owner_slack_dm():
+        return (f"run_in_user_terminal is refused on Slack, even in the owner's own DM: it needs a healthy Hermes on "
+                f"the owner's Mac. This IS the owner's DM, so do not tell them it needs the owner. If they want a "
+                f"machine looked at or repaired (display, mouse, frozen app, reboot), call mac_ops_handoff with their "
+                f"request now: the owner-only machine agent diagnoses, repairs and posts a screenshot in this thread. "
+                f"Say in one line that you handed it over. Never hand over commands to paste, keyboard shortcuts or "
+                f"other do-it-yourself steps. Any other command: say it needs their Desktop/CLI chat.")
     return (f"run_in_user_terminal is refused here: it opens a confirm window on the owner's Mac and is only "
             f"available in the owner's own chats (Desktop, CLI, TUI, API). This session is on {where}, so the "
             f"person asking may not be the owner. Do not run the command another way and do not hand it over "

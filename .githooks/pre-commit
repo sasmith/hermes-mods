@@ -1,23 +1,60 @@
 #!/bin/sh
 # Refuse commits that would publish secrets or private details. This repo is PUBLIC.
-#  1. gitleaks on the staged diff (brew install gitleaks)
-#  2. a private denylist (personal names, hosts, employer internals), one regex per line, read from
-#     $HERMES_MODS_DENYLIST or ~/code/hermes/mods-denylist.txt — kept outside this repo on purpose.
+#  1. gitleaks on the staged diff (install: ./install.sh --tools)
+#  2. a private denylist (personal names, hosts, employer internals), one regex per line, kept outside this repo
+#     on purpose. First found of: $HERMES_MODS_DENYLIST, ~/code/hermes/mods-denylist.txt (Macs),
+#     ~/.hermes/repos/hermes-state/mods-denylist.txt (Linux hub).
+# A missing gitleaks or denylist REFUSES the commit (it used to warn and pass, so Linux hosts committed unscanned).
+# Emergency only: HERMES_MODS_ALLOW_UNSCANNED=1 git commit ...   (prints a loud warning)
+# `sh .githooks/pre-commit --check-tools` prints the missing tools ("gitleaks denylist") and exits 1 if any;
+# hermes-sync uses it to log/notify hosts that cannot commit safely.
 # Enable once per clone: git config core.hooksPath .githooks   (hermes-sync does this for you)
 set -e
 cd "$(git rev-parse --show-toplevel)"
+
+deny=""
+for c in "${HERMES_MODS_DENYLIST:-}" "$HOME/code/hermes/mods-denylist.txt" \
+         "$HOME/.hermes/repos/hermes-state/mods-denylist.txt"; do
+  if [ -n "$c" ] && [ -f "$c" ]; then deny="$c"; break; fi
+done
+missing=""
+command -v gitleaks >/dev/null 2>&1 || missing="gitleaks"
+[ -n "$deny" ] || missing="${missing:+$missing }denylist"
+
+if [ "${1:-}" = "--check-tools" ]; then
+  [ -n "$missing" ] && echo "$missing"
+  [ -z "$missing" ]; exit $?
+fi
+
+if [ -n "$missing" ]; then
+  if [ "${HERMES_MODS_ALLOW_UNSCANNED:-}" = "1" ]; then
+    echo "pre-commit: WARNING: HERMES_MODS_ALLOW_UNSCANNED=1 — committing to a PUBLIC repo WITHOUT: $missing" >&2
+  else
+    echo "pre-commit: refusing to commit to this PUBLIC repo: privacy check(s) cannot run: $missing" >&2
+    case " $missing " in *" gitleaks "*)
+      if [ "$(uname -s)" = "Darwin" ]; then
+        echo "  gitleaks: brew install gitleaks   (or ./install.sh --tools)" >&2
+      else
+        echo "  gitleaks: ./install.sh --tools   (downloads the pinned release into ~/.local/bin; make sure it is on PATH)" >&2
+      fi ;;
+    esac
+    case " $missing " in *" denylist "*)
+      echo "  denylist: none at \$HERMES_MODS_DENYLIST, ~/code/hermes/mods-denylist.txt or ~/.hermes/repos/hermes-state/mods-denylist.txt" >&2
+      echo "            (it lives in the private state repo; clone it, or point HERMES_MODS_DENYLIST at a copy)" >&2 ;;
+    esac
+    echo "  emergency only: HERMES_MODS_ALLOW_UNSCANNED=1 git commit ..." >&2
+    exit 1
+  fi
+fi
 
 if command -v gitleaks >/dev/null 2>&1; then
   gitleaks git --pre-commit --staged --no-banner --redact -c .gitleaks.toml >/dev/null 2>&1 || {
     echo "pre-commit: gitleaks found a possible secret — run: gitleaks git --pre-commit --staged -v -c .gitleaks.toml" >&2
     exit 1
   }
-else
-  echo "pre-commit: gitleaks not installed; skipping secret scan (brew install gitleaks)" >&2
 fi
 
-deny="${HERMES_MODS_DENYLIST:-$HOME/code/hermes/mods-denylist.txt}"
-if [ -f "$deny" ]; then
+if [ -n "$deny" ]; then
   pats=$(mktemp); grep -v '^[[:space:]]*#' "$deny" | grep -v '^[[:space:]]*$' > "$pats" || true
   if [ -s "$pats" ]; then
     hits=$(git diff --cached -U0 --diff-filter=AM | grep '^+' | grep -v '^+++' | grep -nEi -f "$pats" | cut -c1-160 || true)

@@ -3,12 +3,14 @@
 ## Behavior
 
 On a Linux/cloud gateway (no `osascript`, no cmux) `run_in_user_terminal` is still registered with the same
-schema. Calling it opens the usual y/N confirm window on the owner's Mac, runs the command there after `y`, and
+schema. Calling it opens the usual window on the owner's Mac, runs the command there (right away by default; after `y` when
+`user_terminal.confirm` is `remote` or `all`), and
 returns status / exit code / output to the remote agent, with the same `pending` + `job_id` resume semantics.
 
 Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/tests/user-terminal.test.mjs`):
 
-1. Nothing runs without the owner typing `y` in the Mac window. The relayed path only ever calls
+1. With `user_terminal.confirm: remote|all`, nothing runs without the owner typing `y` in the Mac window
+   (default `off`: it runs at once, by the owner's choice). The relayed path only ever calls
    `create_job` + `open_window`; `runner.sh` declines on Enter / `n`.
 2. Only the owner's own sessions may call it: every identity the turn has (`HERMES_PLATFORM`,
    session platform/source, the session row's `source`) must be one of `desktop`, `api_server`, `tui`, `cli`,
@@ -19,6 +21,12 @@ Invariants (each has a test in `tests_user_terminal.py` or `../session-mentions/
    ("<title>")`, and the window title is `Hermes (<gw>/<p>) wants to run a command`. The gateway name is the
    courier's own name for the connection it drained, not a value the remote agent chose. Control characters in the
    command, reason, cwd and origin are shown as `^[`-style text, so a relayed command cannot redraw the window.
+   The refusal is by surface, not by person, and stays for the owner's own Slack DM too (arbitrary shell still needs
+   the y-window). For that one case, detected from Slack-verified session fields (`owner.slack_user_ids` +
+   DM), the refusal text changes: it tells the agent to call `mac_ops_handoff`, which passes a machine problem to
+   the owner-only `mac-ops` profile (plugins `slack-workspace` `ownerops.py` + `mac-ops`), and never to hand over
+   commands, paste-it steps or keyboard shortcuts. Channels and other users get the old text. Test:
+   `test_owner_dm_refusal_routes_to_ops_not_paste_it`.
 4. No Desktop courier for that Mac online -> the tool errors at once (no outbox write). A live courier that does
    not claim the request within 15 s -> error and the request is withdrawn.
 
@@ -52,6 +60,8 @@ remote agent polls results/<id>.json; one start request, then status requests of
 
 ```
 cd plugins/user-terminal && uv run --with pytest --with fastapi --with httpx python -m pytest -q -p no:cacheprovider tests_user_terminal.py
+cd plugins/slack-workspace && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_ownerops.py
+cd plugins/mac-ops && uv run --with pytest python -m pytest -q -p no:cacheprovider tests_mac_ops.py
 cd plugins/session-mentions && node --test --test-reporter=tap tests/user-terminal.test.mjs
 ```
 

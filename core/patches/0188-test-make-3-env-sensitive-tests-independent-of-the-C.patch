@@ -1,0 +1,109 @@
+From d1b1531c1b8ea38c8945a65c21f4bd240fb6eef8 Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 04:01:03 -0700
+Subject: [PATCH] test: make 3 env-sensitive tests independent of the CI runner
+ (#12)
+
+* test: make orphan-readopt, termux-detection and extract-plugins tests CI-environment independent [daveey]
+
+- orphan readopt: adopter subprocesses get the repo root on PYTHONPATH (script dir, not cwd, is on sys.path) and surface stderr instead of an IndexError
+- termux detection: pin is_container False (CI runners are containers)
+- extract-plugins: format git committer epoch as UTC Z rather than relying on %cI, whose UTC rendering varies across git versions
+
+* fix(lint): use datetime.UTC alias in extract-plugins (UP017)
+---
+ tests/tools/test_process_orphan_readopt_tui.py | 16 +++++++++++++---
+ tests/tools/test_termux_api_detection.py       |  9 +++++++++
+ website/scripts/extract-plugins.py             |  8 ++++++--
+ 3 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/tests/tools/test_process_orphan_readopt_tui.py b/tests/tools/test_process_orphan_readopt_tui.py
+index 9ffc8fbe4e..70a2c11576 100644
+--- a/tests/tools/test_process_orphan_readopt_tui.py
++++ b/tests/tools/test_process_orphan_readopt_tui.py
+@@ -11,6 +11,7 @@ import json
+ import subprocess
+ import sys
+ import time
++from pathlib import Path
+ from unittest.mock import patch
+ 
+ import pytest
+@@ -217,9 +218,18 @@ def test_concurrent_backends_adopt_an_orphan_once(checkpoint, procs, tmp_path):
+         "    print(ProcessRegistry().recover_from_checkpoint(owner='tui'), flush=True)\n"
+         "    time.sleep(10)\n")  # stay alive: a live writer is what makes the sibling skip
+     import os
+-    runs = [subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, text=True,
+-                             cwd=os.getcwd(), env=os.environ.copy()) for _ in range(4)]
+-    counts = [int(run.communicate(timeout=60)[0].strip().splitlines()[-1]) for run in runs]
++    # `python script.py` puts the script's dir (tmp_path), not the cwd, on sys.path, so the repo
++    # root must be passed explicitly or `import tools...` fails wherever the repo isn't installed
++    # editable (CI), leaving empty stdout and an IndexError instead of the real error.
++    repo_root = str(Path(__file__).resolve().parents[2])
++    env = os.environ.copy()
++    env["PYTHONPATH"] = os.pathsep.join(filter(None, [repo_root, env.get("PYTHONPATH")]))
++    runs = [subprocess.Popen([sys.executable, str(script)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
++                             text=True, cwd=repo_root, env=env) for _ in range(4)]
++    outs = [run.communicate(timeout=60) for run in runs]
++    for run, (out, err) in zip(runs, outs):
++        assert run.returncode == 0 and out.strip(), f"adopter subprocess failed ({run.returncode}): {err}"
++    counts = [int(out.strip().splitlines()[-1]) for out, _ in outs]
+     assert sorted(counts) == [0, 0, 0, 1]
+ 
+ 
+diff --git a/tests/tools/test_termux_api_detection.py b/tests/tools/test_termux_api_detection.py
+index 4016e0df99..b40e3afe7c 100644
+--- a/tests/tools/test_termux_api_detection.py
++++ b/tests/tools/test_termux_api_detection.py
+@@ -21,6 +21,7 @@ These tests pin the new probe ladder:
+ from __future__ import annotations
+ 
+ import subprocess
++import pytest
+ from types import SimpleNamespace
+ 
+ 
+@@ -156,6 +157,14 @@ class TestDetectAudioEnvironmentTermuxFallback:
+     no longer see the misleading 'Termux:API Android app is not installed'
+     warning when the package-manager probe is inconclusive."""
+ 
++    @pytest.fixture(autouse=True)
++    def _not_in_container(self, monkeypatch):
++        # CI runners are containers (/.dockerenv), which adds an unrelated "no audio devices" warning
++        # and flips `available`; these tests are about the Termux:API branch only.
++        monkeypatch.setattr("hermes_constants.is_container", lambda: False)
++        for var in ("PULSE_SERVER", "PIPEWIRE_REMOTE"):
++            monkeypatch.delenv(var, raising=False)
++
+     def test_inconclusive_probes_with_binary_does_not_emit_app_warning(
+         self, monkeypatch
+     ):
+diff --git a/website/scripts/extract-plugins.py b/website/scripts/extract-plugins.py
+index 49bc6d311a..b175e7ee17 100644
+--- a/website/scripts/extract-plugins.py
++++ b/website/scripts/extract-plugins.py
+@@ -158,7 +158,7 @@ def load_git_dates(catalog_dir: Path) -> dict[str, dict[str, str]]:
+             _log("shallow checkout: skipping addedAt/updatedAt (need fetch-depth: 0)")
+             return {}
+         log = subprocess.run(
+-            ["git", "log", "--format=%x00%cI", "--name-status", "--relative", "-M", "--", "."],
++            ["git", "log", "--format=%x00%ct", "--name-status", "--relative", "-M", "--", "."],
+             cwd=catalog_dir, capture_output=True, text=True, check=True, timeout=120,
+         ).stdout
+     except (OSError, subprocess.SubprocessError) as e:
+@@ -179,7 +179,11 @@ def load_git_dates(catalog_dir: Path) -> dict[str, dict[str, str]]:
+     when = ""
+     for line in log.splitlines():
+         if line.startswith("\x00"):
+-            when = line[1:].strip()
++            # Epoch -> UTC "Z" ourselves: git's %cI prints "+00:00" or "Z" for UTC depending on version.
++            try:
++                when = datetime.fromtimestamp(int(line[1:].strip()), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
++            except ValueError:
++                when = ""
+             continue
+         parts = line.split("\t")
+         if len(parts) < 2 or not when:
+-- 
+2.55.0
+

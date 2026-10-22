@@ -1,0 +1,5 @@
+{"ts": 1792656000.0, "event": "reply_checked", "session_id": "20261022_080000_aaaaaa", "platform": "cli", "candidates": []}
+{"ts": 1792656060.0, "event": "fixloop_card", "session_id": "20261022_080000_aaaaaa", "task_id": "t_0000beef", "n": 2, "issue": "draft text is lost on new chat"}
+{"ts": 1792656120.0, "event": "reply_nudge", "session_id": "20261022_080100_cccccc", "rule": "handoff", "p": 0.91, "evidence": "asks the user to run the restart command himself"}
+{"ts": 1792656180.0, "event": "reply_nudge", "session_id": "20261022_080100_cccccc", "rule": "confirm", "p": 0.88, "evidence": "asks for confirmation it did not need"}
+{"ts": 1792656240.0, "event": "selfheal_would_file", "fingerprint": "agent-0123456789"}

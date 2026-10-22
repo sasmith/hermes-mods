@@ -19,6 +19,16 @@ The run that actually builds your commit is often one started by someone else's 
 watchers miss it and wait for hours while the session looks idle. Ask instead whether any successful run, or
 any release tag, *contains* your commit.
 
+## Fixing the CI you wait on: use a worktree
+
+A CI fix (or any branch work) goes in its own worktree: `git worktree add <dir> -b <fix-branch> origin/main`, then
+push from there. Never `git checkout`/`switch` a branch in a shared checkout that something runs from (a sync
+mirror, a deploy checkout, the live app checkout): the scripts and services in it vanish with the old branch. That
+happened when CI-fix workers switched a sync mirror to fork branches and its launchd job failed for 4 hours.
+[branch-pin-guard](../../../plugins/branch-pin-guard/) blocks this for checkouts listed in
+`$HERMES_HOME/branch-pins.json`. A checkout you find off its branch: commit or stash the stray work onto its own
+branch, check the pinned branch back out, and carry on in a worktree.
+
 ## Use the script
 
 `scripts/wait_for_ci.py` (in this skill's dir). Run it from inside the repo checkout; it needs `git` and an authenticated `gh`.
@@ -95,11 +105,17 @@ workers to stop chasing tests.
    many probes, first and last times), then narrow the cause yourself before handing them pages to click:
    - Scope: list the account's repos' newest runs. Public repos still running while private ones are refused
      means GitHub is blocking all *paid* usage on the account, not one workflow or repo.
-   - Usage: `gh api /users/<user>/settings/billing/usage/summary` gives month-to-date spend per SKU. There's
-     no API for a personal account's budgets (`/users/<u>/settings/billing/budgets` is 404), so ask the user for
-     a screenshot of the Budgets and Payment history pages instead of guessing.
-   - Mail: search the user's inbox for GitHub mail since the block began (budget reached, payment failed). No
-     such mail plus a budget under its cap plus all-successful payments points away from budget/charges.
+   - Usage: `gh api "/users/<user>/settings/billing/usage?year=Y&month=M"` returns per-day, per-repo, per-SKU
+     items: aggregate `grossAmount` by (repo, sku) and by day to find the runaway workflow (hosted macOS is the
+     usual one). There's no API for a personal account's budgets (`/settings/billing/budgets` is 404): read the
+     Budgets, Payment information and Payment history pages yourself with `browser_exec(local=true)` (the user's
+     signed-in Chrome) instead of asking for screenshots.
+   - Mail: search the user's Gmail (same browser) for GitHub mail since the block began (budget reached,
+     payment failed, `[GitHub Support]`). No such mail plus a budget under its cap plus all-successful payments
+     points away from budget/charges.
+   - "The issue we filed" about billing usually means a GitHub Support ticket, not a Kanban/board card: find its
+     id in the `[GitHub Support]` mail and read it at `https://support.github.com/ticket/personal/0/<id>` before
+     answering. Check board cards only if no ticket exists.
    - Then the remaining documented cause is a failed card **authorization hold**: GitHub places holds after
      significant metered usage or a budget increase, a declined hold locks billing, and it never appears in
      payment history (that only lists completed charges). Docs:
@@ -107,18 +123,12 @@ workers to stop chasing tests.
      declined GitHub authorization at the bank, re-save the card on the Payment information page (that triggers a
      new authorization), and otherwise open a support ticket asking for a billing-lock review.
    - Keep the probe running throughout; it ends the wait the moment any of these clears it.
-5. **When the user says billing can't be fixed, move the repo to self-hosted runners instead of waiting.** On a
-   personal account runners are registered per repo, so a new repo has none even when a sibling repo already has
-   self-hosted machines. Reuse the sibling's install scripts with the repo name substituted (runner dir, service
-   label, `--url`), get a token with `gh api -X POST repos/OWNER/REPO/actions/runners/registration-token -q .token`,
-   and use repo-specific labels (e.g. `<prefix>-mac`, `<prefix>-linux`) so the two repos' jobs don't take each
-   other's machines. Linux installs need no sudo (user systemd unit). A macOS LaunchDaemon needs sudo on that
-   host, so run it through `run_in_user_terminal` with `ssh -t host 'sudo bash …'`. Then change every `runs-on`
-   to the new labels, push, and confirm with the run's jobs' `runner_name` before telling running workers that
-   CI counts as a gate again.
-6. **PRs refused during the outage:** `gh run rerun` replays the workflow file from the PR's head commit. If main
-   changed `runs-on` meanwhile (e.g. moved to self-hosted runners to escape billing), the rerun is refused again.
-   Rebase the branch onto `origin/main` and force-push (`--force-with-lease`) so the new workflow runs.
+5. **When billing can't be fixed soon, move repos to self-hosted runners instead of waiting** (registration,
+   no-sudo workflow edits, dirty-checkout pitfalls, refused PR reruns): `references/self-hosted-runner-migration.md`.
+   Before moving a repo, check its `runs-on` and runners: another session may have moved it already.
+6. **Detection:** `~/.hermes/scripts/gh_actions_billing_watch.py` (hourly no_agent cron) alerts on refused jobs,
+   daily hosted spend and non-Linux SKUs, posting to the Hermes Inbox itself because Desktop cron has no home
+   channel (`deliver=all` fails with "no delivery target"). Run it with `--force` for live state.
 
 ## Rescuing a session already stuck on a hand-rolled watcher
 

@@ -1,0 +1,18 @@
+name: selfheal
+label: Self-heal proposal
+fields:
+  fp: {required: true}
+actions:
+  - id: do_it
+    label: Do it
+    icon: play
+    style: primary
+    kind: resolve
+    confirm: Start the fix card for this defect now?
+  - {id: not_now, label: Not now, icon: clock, kind: resolve}
+  - id: never
+    label: Never
+    icon: circle-slash
+    style: danger
+    kind: resolve
+    confirm: Never file this defect again?

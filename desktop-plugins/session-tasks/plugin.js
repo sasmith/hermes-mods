@@ -38,10 +38,26 @@ const STATE_COLOR = {
   error: '#f85149',
   ready: '#8b949e',
   todo: '#8b949e',
-  scheduled: '#8b949e',
+  scheduled: '#e3b341', // waiting on a timer
   blocked: '#f85149',
   review: '#db61a2'
 }
+
+// States whose whole pill (border + fill) takes the state colour, not just the dot/label.
+const TINTED_STATES = new Set(['scheduled'])
+
+/** Pill border/background for a chip state (exported for tests). */
+export function chipFrame(state) {
+  const c = TINTED_STATES.has(state) && STATE_COLOR[state]
+  return c
+    ? { border: `1px solid color-mix(in srgb, ${c} 60%, transparent)`, background: `color-mix(in srgb, ${c} 14%, transparent)` }
+    : {
+        border: '1px solid color-mix(in srgb, var(--border, #8884) 80%, transparent)',
+        background: 'color-mix(in srgb, var(--card, transparent) 60%, transparent)'
+      }
+}
+
+export const chipColor = state => STATE_COLOR[state] || STATE_COLOR.running
 
 const str = v => (typeof v === 'string' ? v : v == null ? '' : String(v))
 const truncate = (s, n = MAX_LABEL) => (s.length > n ? `${s.slice(0, n - 1)}…` : s)
@@ -372,7 +388,7 @@ function subscribe(fn) {
 const KIND_GLYPH = { bg: 'codicon-server-process', sub: 'codicon-agent', kanban: 'codicon-tasklist', machine: 'codicon-vm' }
 
 function Chip({ chip, now }) {
-  const color = STATE_COLOR[chip.state] || STATE_COLOR.running
+  const color = chipColor(chip.state)
   const showMachine = chip.kind === 'machine' && typeof window.__computeRentalsShow === 'function'
   const clickable = chip.kind === 'kanban' || showMachine
   const onClick = chip.kind === 'kanban'
@@ -396,8 +412,7 @@ function Chip({ chip, now }) {
       maxWidth: 280,
       padding: '1px 8px',
       borderRadius: 999,
-      border: '1px solid color-mix(in srgb, var(--border, #8884) 80%, transparent)',
-      background: 'color-mix(in srgb, var(--card, transparent) 60%, transparent)',
+      ...chipFrame(chip.state),
       color: 'var(--muted-foreground, inherit)',
       fontSize: 11,
       lineHeight: '18px',

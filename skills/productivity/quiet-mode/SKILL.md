@@ -10,9 +10,9 @@ metadata:
 
 # Quiet / movie mode
 
-Plugin `~/.hermes/plugins/quiet-mode` (enabled, synced via daveey/hermes). While on, a `pre_tool_call` hook in
-EVERY Hermes process on this Mac (all sessions, profiles, cron, subagents) blocks tools that touch the screen or
-speakers. State: `~/.hermes/quiet-mode.json` (host-wide, re-read on every tool call → instant effect).
+Plugin `~/.hermes/plugins/quiet-mode` gates recognized screen/speaker tool calls in processes that loaded it.
+State: `~/.hermes/quiet-mode.json` (host-wide, re-read per call). An enabled flag is not proof of silence;
+verify the offending workload separately when the user reports noise.
 
 ## Toggle ("movie mode", "I'm watching something", "stop using my screen")
 
@@ -34,10 +34,26 @@ terminal/execute_code/process commands matching `open`, `osascript`, `say`, `afp
 Don't retry or work around it with another tool/script. Keep doing silent work; if the step is required, end
 the turn with a note of what is pending. Never turn quiet mode off yourself unless the user asks.
 
+## Ending quiet mode ("done with the movie", "tell sessions to resume")
+
+1. `~/.hermes/bin/hermes-quiet off` (then `status` to confirm).
+2. Find paused work: workers that hit the gate end up as `blocked` Kanban cards whose reason mentions quiet mode.
+   Scheduled cards and live chat sessions pick up again without help. The live board is `~/.hermes/kanban.db`;
+   `~/.hermes/kanban/kanban.db` and `kanban/boards/*/kanban.db` can be empty or stale, so querying those misses
+   the cards. Search in one query:
+   `sqlite3 ~/.hermes/kanban.db "select id,status,title from tasks where status='blocked' and id in (select task_id from task_events where kind='blocked' and lower(payload) like '%quiet%')"`
+3. For each match, run `kanban_unblock` and `kanban_comment` ("quiet mode is off, resume screen/simulator steps").
+   Leave cards blocked on other human steps (such as daytime device tests) alone, and list them in the reply.
+
 ## Pitfalls
 
 - A newly enabled/edited plugin loads only in NEW Hermes processes; the running Desktop backend needs an app
   restart. The state file, by contrast, is live.
-- Not covered: the Desktop app's own completion beep/notifications (app-side), and processes not spawned by Hermes.
+- Treat movie mode as a request for uninterrupted playback, not merely an enabled flag. Keep host volume unchanged
+  when silencing another workload. A tool-call gate does not suspend already-running processes; Desktop's own
+  sounds and non-Hermes processes also need separate checks.
+- For an authorized simulator shutdown: `xcrun simctl list devices booted`, then `xcrun simctl shutdown <UDID>`
+  for the identified device, then repeat the list to verify. This stops the device, not its owning agent session
+  or future launches; report those separately. Do not describe shutdown as a persistent speaker-access block.
 - Extend coverage by editing `BLOCK_TOOLS` / `HA_BLOCK_DOMAINS` / `_SHELL_PATTERNS`, then run
   `~/.hermes/hermes-agent/venv/bin/python -m pytest -q ~/.hermes/plugins/quiet-mode/tests_quiet.py`.

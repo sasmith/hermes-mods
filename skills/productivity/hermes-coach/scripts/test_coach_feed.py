@@ -1,5 +1,5 @@
 """Tests for coach_feed.py conflict handling. Run: python3 -B -m unittest test_coach_feed (from scripts/)."""
-import json, subprocess, sys, tempfile, unittest
+import json, os, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -65,6 +65,79 @@ class ConflictTest(unittest.TestCase):
         st = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertIn("notes.txt", st["skipped"])
         self.assertIn("ERROR", r.stderr)
+
+
+class ForwardSignalsTest(unittest.TestCase):
+    def test_runs_the_forwarder_with_host_and_home(self):
+        seen = []
+
+        def runner(cmd, **kw):
+            seen.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "signals: forwarded 3 to you@hub.example.com", "")
+        out = coach_feed.forward_signals("macbook", "/tmp/h", runner=runner)
+        self.assertIn("forwarded 3", out)
+        cmd = seen[0]
+        self.assertTrue(cmd[1].endswith("plugins/coach/signals.py"))
+        self.assertEqual(cmd[2:], ["--host", "macbook", "--home", "/tmp/h", "forward"])
+
+    def test_failure_is_reported_not_raised(self):
+        def boom(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 150)
+        self.assertEqual(coach_feed.forward_signals("mini", None, runner=boom), "error: TimeoutExpired")
+        bad = lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, "", "ssh failed")
+        self.assertEqual(coach_feed.forward_signals("mini", None, runner=bad), "error: ssh failed")
+
+    def test_no_hub_configured_says_so_and_ships_nothing(self):
+        h = Path(tempfile.mkdtemp())
+        out = coach_feed.forward_signals("macbook", str(h))
+        self.assertIn("no hub configured", out)
+        self.assertEqual(coach_feed.signals_state(out), "no-hub")
+        self.assertFalse((h / "coach" / "signals-cursor.json").exists())
+
+
+class FeedStatusTest(unittest.TestCase):
+    """<host>/feed-status.json: the hub's only view of a Mac forwarder that never reached it."""
+
+    def test_states(self):
+        s = coach_feed.signals_state
+        self.assertEqual(s("signals: heartbeat ok to you@hub.example.com"), "ok")
+        self.assertEqual(s("signals: forwarded 4 to you@hub.example.com"), "ok")
+        self.assertEqual(s("signals: this host is the hub (its own cron sweeps locally)"), "hub")
+        self.assertEqual(s("error: signals forward to you@hub.example.com failed (2 pending): Permission denied"),
+                         "error")
+        self.assertEqual(s("ok"), "unknown")
+
+    def test_written_only_when_health_changes(self):
+        repo = Path(tempfile.mkdtemp())
+        w = coach_feed.write_feed_status
+        self.assertTrue(w(repo, "mini", "signals: no hub configured (x)", now="t1"))
+        self.assertFalse(w(repo, "mini", "signals: no hub configured (x)", now="t2"))
+        self.assertTrue(w(repo, "mini", "signals: forwarded 3 to you@hub.example.com", now="t3"))
+        self.assertFalse(w(repo, "mini", "signals: heartbeat ok to you@hub.example.com", now="t4"))
+        self.assertFalse(w(repo, "mini", "signals: forwarded 9 to you@hub.example.com", now="t5"))
+        err = "error: signals forward to you@hub.example.com failed ({} pending): Permission denied"
+        self.assertTrue(w(repo, "mini", err.format(2), now="t6"))
+        self.assertFalse(w(repo, "mini", err.format(5), now="t7"))  # the pending count alone is not a change
+        st = json.loads((repo / "mini" / "feed-status.json").read_text())
+        self.assertEqual(st["signals"], "error")
+        self.assertEqual(st["since"], "t6")
+        self.assertIn("(pending)", st["detail"])
+
+    def test_main_commits_the_status(self):
+        d = Path(tempfile.mkdtemp())
+        repo, home = d / "repo", d / "home"
+        repo.mkdir(); home.mkdir()
+        g(repo, "init", "-q", "-b", "main")
+        (repo / "README.md").write_text("x\n")
+        g(repo, "add", "-A"); g(repo, "commit", "-qm", "base")
+        (repo / "h").mkdir()
+        r = subprocess.run([sys.executable, str(HERE / "coach_feed.py"), "--host", "h", "--repo-dir", str(repo),
+                            "--home", str(home), "--no-push"], capture_output=True, text=True,
+                           env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        st = json.loads(g(repo, "show", "HEAD:h/feed-status.json"))
+        self.assertEqual(st["signals"], "no-hub")
 
 
 if __name__ == "__main__":

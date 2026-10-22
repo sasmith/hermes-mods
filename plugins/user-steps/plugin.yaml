@@ -1,0 +1,11 @@
+name: user-steps
+version: 0.1.0
+description: >
+  Tracks what each chat is waiting for the user to do. An aux model reads every final reply and records the
+  asks (approve / do / choose / input) in a per-chat ledger; Desktop replies get each ask framed as a
+  ::user-step box with buttons, the Desktop 'For you' strip lists open steps, and one rolling blocked Kanban
+  card per chat shows it as waiting on the user until the last step is resolved. Replaces open-asks.
+author: daveey
+provides_hooks:
+  - pre_llm_call
+  - transform_llm_output

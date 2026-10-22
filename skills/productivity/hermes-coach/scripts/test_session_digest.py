@@ -143,6 +143,34 @@ class DigestSynthetic(unittest.TestCase):
         self.assertEqual(dg["user_turns_total"], 2)
         self.assertEqual(dg["signals"].get("repeat_fix"), 1)
 
+    def test_each_user_turn_carries_the_agent_reply_before_it(self):
+        t = time.time() - 100
+        long = "Shipped the fix to /Users/x/code/app. " + "detail " * 200 + "Want me to also restart the pod?"
+        rows = [("user", "fix the sidebar", t, 1, 0, None, None, "u1"),
+                ("assistant", long, t + 1, 1, 0, None, None, "a1"),
+                ("assistant", "", t + 2, 1, 0, None, None, "a2"),  # an empty tool-call turn is not the reply
+                ("user", "nope, still broken", t + 3, 1, 0, None, None, "u2")]
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "state.db"
+            make_db(db, rows)
+            (dg,) = list(sd.digest_db("default", db, "test", 0))
+        first, second = dg["user_turns"]
+        self.assertNotIn("prev", first)
+        self.assertTrue(second["prev"].startswith("Shipped the fix to ~/code/app."))
+        self.assertTrue(second["prev"].endswith("Want me to also restart the pod?"))
+        self.assertIn("…[clipped]…", second["prev"])
+        self.assertLessEqual(len(second["prev"]), sd.PREV_HEAD + sd.PREV_TAIL + 20)
+        self.assertEqual(dg["digest_v"], 6)
+
+
+class ExcludeProfileGlob(unittest.TestCase):
+    def test_glob_drops_follower_profile(self):
+        self.assertTrue(sd.excluded_profile("alpha-follow", ["alpha*"]))
+        self.assertTrue(sd.excluded_profile("alpha", ["alpha*"]))
+        self.assertFalse(sd.excluded_profile("default", ["alpha*"]))
+        self.assertTrue(sd.excluded_profile("alpha", ["alpha"]))  # exact names still work
+        self.assertFalse(sd.excluded_profile("alpha-follow", ["alpha"]))
+
 
 if __name__ == "__main__":
     unittest.main()

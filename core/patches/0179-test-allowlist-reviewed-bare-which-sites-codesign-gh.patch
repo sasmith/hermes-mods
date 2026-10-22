@@ -1,0 +1,47 @@
+From 245684388f2182f75feacacfe9032c5e75f1697e Mon Sep 17 00:00:00 2001
+From: daveey <daveey@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 06:49:14 +0000
+Subject: [PATCH] test: allowlist reviewed bare which() sites (codesign, gh)
+ (#10)
+
+main_desktop prebuilt-app checks resolve macOS codesign; review_session_activity._gh resolves gh with homebrew fallbacks. Both are system tools, not Hermes-managed runtimes.
+---
+ tests/fixtures/resolution_allowlist.json | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/tests/fixtures/resolution_allowlist.json b/tests/fixtures/resolution_allowlist.json
+index 66d3e51c8c..7c2bb44e12 100644
+--- a/tests/fixtures/resolution_allowlist.json
++++ b/tests/fixtures/resolution_allowlist.json
+@@ -307,6 +307,16 @@
+     "symbol": "cmd_gui",
+     "kind": "bare_which"
+   },
++  {
++    "path": "hermes_cli/main_desktop.py",
++    "symbol": "_prebuilt_desktop_app_mismatch",
++    "kind": "bare_which"
++  },
++  {
++    "path": "hermes_cli/main_desktop.py",
++    "symbol": "_prebuilt_signature_error",
++    "kind": "bare_which"
++  },
+   {
+     "path": "hermes_cli/main_tui_launch.py",
+     "symbol": "_apply_tui_python_env",
+@@ -658,6 +668,11 @@
+     "symbol": "<module>",
+     "kind": "known_path_table"
+   },
++  {
++    "path": "hermes_cli/review_session_activity.py",
++    "symbol": "_gh",
++    "kind": "bare_which"
++  },
+   {
+     "path": "tools/bot_desktop/browser.py",
+     "symbol": "_system_executable",
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,7 @@
+{"id": "a", "label": 1, "component": "desktop", "split": "dev", "src": "broad", "text": "i think the sort is broken", "prev_reply": "Sidebar now sorts by creation time."}
+{"id": "b", "label": 1, "component": "agent", "split": "test", "src": "broad", "text": "why are you asking me to open a terminal instead of doing it yourself?", "prev_reply": "Run this in a terminal: sudo foo"}
+{"id": "c", "label": 1, "component": "desktop", "split": "test", "src": "random", "text": "shows no tasks, but the session says there are some [screenshot]", "prev_reply": ""}
+{"id": "d", "label": 1, "component": "agent", "split": "dev", "src": "random", "text": "my alarm is not set - are you sure?", "prev_reply": "Your alarm is set for 7am."}
+{"id": "e", "label": 0, "component": "", "split": "dev", "src": "random", "text": "do it", "prev_reply": "Want me to ship it?"}
+{"id": "f", "label": 0, "component": "", "split": "test", "src": "random", "text": "make a graph of my steps and sleep", "prev_reply": ""}
+{"id": "g", "label": 0, "component": "", "split": "test", "src": "broad", "text": "the menu should be shorter, can you fix the spacing", "prev_reply": "Here is the new menu."}

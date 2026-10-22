@@ -12,14 +12,17 @@ What goes in: session stats, the user's turns (injected context stripped, secret
 truncated), tool counts and tool-error counts, pattern signals, and the tail of the last
 assistant reply. What never goes in: tool output, system prompts, reasoning, file contents.
 """
-import argparse, collections, json, os, re, sqlite3, sys, time
+import argparse, collections, fnmatch, json, os, re, sqlite3, sys, time
 from pathlib import Path
 
-DIGEST_V = 5            # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
+DIGEST_V = 6            # v6: each user turn carries `prev`, the agent reply before it (head+tail clip), for the
+                        #     self-heal backstop judge (without it \"why didnt this work\" reads as a new issue)
+                        # v5: Kanban notices, cron prompts, compaction/continuation notes are synthetic, not user turns
                         # v4: `features` (content-free feature-use counts for curriculum adoption checks)
 MAX_TURNS = 60          # keep the first 10 and the last 50 user turns
 TURN_CHARS = 500
 LAST_REPLY_CHARS = 800
+PREV_HEAD, PREV_TAIL = 150, 450  # `prev` per user turn: a reply's ending (\"Done.\", \"Want me to…?\") is what a correction answers
 
 # Blocks Hermes injects into user messages; they are not the user's words.
 INJECTED = [
@@ -183,6 +186,11 @@ def trunc(s: str, n: int) -> str:
     return s if len(s) <= n else s[: n - 15] + " …[truncated]"
 
 
+def clip_ends(s: str, head: int = PREV_HEAD, tail: int = PREV_TAIL) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= head + tail + 20 else s[:head] + " …[clipped]… " + s[-tail:]
+
+
 def discover_dbs(home: Path):
     out = []
     if (home / "state.db").exists():
@@ -283,7 +291,10 @@ def digest_db(profile, db, host, since):
                 n_real += 1
                 if users and users[-1]["text"] == trunc(text, TURN_CHARS):
                     continue  # the same turn persisted twice (retry / steer echo)
-                users.append({"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)})
+                turn = {"t": round(m["timestamp"]), "text": trunc(text, TURN_CHARS)}
+                if last_reply.strip():
+                    turn["prev"] = clip_ends(redact(_home_rel(last_reply) or ""))
+                users.append(turn)
             elif role == "assistant":
                 if content.strip():
                     last_reply = content
@@ -350,6 +361,11 @@ def _home_rel(s):
     return re.sub(r"/Users/[^/\s]+/|/home/[^/\s]+/", "~/", s) if isinstance(s, str) else s
 
 
+def excluded_profile(profile, patterns):
+    """fnmatch, so 'alpha*' also drops 'alpha-follow' (a plain 'alpha' missed it and leaked Slack chat)."""
+    return any(fnmatch.fnmatchcase(profile, p) for p in patterns)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", required=True)
@@ -358,7 +374,7 @@ def main():
     ap.add_argument("--home", default=os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")))
     ap.add_argument("--since-days", type=float, default=45)
     ap.add_argument("--exclude-profile", action="append", default=[],
-                    help="skip a discovered profile (e.g. a shared team bot holding other people's chats)")
+                    help="skip a discovered profile; glob ok, e.g. 'alpha*' (shared team bots holding other people's chats)")
     a = ap.parse_args()
 
     dbs = []
@@ -366,7 +382,7 @@ def main():
         prof, _, path = d.rpartition("=")
         dbs.append((prof or Path(path).parent.name, Path(path)))
     dbs = dbs or discover_dbs(Path(a.home).resolve())
-    dbs = [(p, d) for p, d in dbs if p not in a.exclude_profile]
+    dbs = [(p, d) for p, d in dbs if not excluded_profile(p, a.exclude_profile)]
     since = time.time() - a.since_days * 86400
     out = Path(a.out) / a.host
     written = unchanged = 0
