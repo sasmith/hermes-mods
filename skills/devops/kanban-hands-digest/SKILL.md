@@ -21,7 +21,10 @@ machine can verify.
 
 "What's blocked?" / "what do you need from me?" means **this chat's cards** (the ones it created or is
 subscribed to — its task strip), not every board. Find them from this session's own `kanban_create` results /
-task strip, then `kanban_show` each and report the blocked ones. Go global (the digest script below, all
+task strip, then `kanban_show` each and report the blocked ones. Re-read each card (`kanban_show`: status, latest comments) right before presenting an ask. The user often
+answers from the Desktop board (a comment by `desktop`), and the worker resumes on its own, so a question
+relayed from an earlier notification may already be stale. When relaying the user's answer to a blocked card,
+post it as a `kanban_comment`, then `kanban_unblock`, then read the status back. Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
 say it's a global view.
 

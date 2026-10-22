@@ -1,6 +1,6 @@
 ---
 name: cloud-service-decommission
-description: Use when shutting down a hosted service to stop billing.
+description: Use when retiring a hosted service or cloud account. Shuts it down, stops billing, and removes its repo references.
 version: 1.0.0
 author: daveey
 license: MIT
@@ -29,9 +29,10 @@ For "we don't use X anymore, shut it down / make sure we aren't paying". The use
    - secrets stored in other systems (Cloudflare Secrets Store, local secret JSON files).
 7. **Remove clutter**, such as stale VPN/WireGuard peers from CI runners. It's free, but it costs nothing to remove.
 8. **Billing check.** Query the org's plan, billing status and credit balance via the provider API. The dashboard billing page may need a browser session. Tell the user if they have to remove the card or close the account by hand.
-9. **Code/doc references** (config files, hardcoded URLs, docs, tests) are a separate, slower step. Hand it to a background job or subagent with a self-contained spec: run tests, push to main, confirm CI is green.
+9. **Code/doc references** (config files, hardcoded URLs, docs, tests) are a separate, slower step. Hand it to a background job or subagent with a self-contained spec: run tests, push to main, confirm CI is green. If the user says the account or service is already being closed, this may be the only step requested. Run it directly and follow the repo's PR convention. The grep, triage and PR recipe is in `references/repo-reference-cleanup.md`.
 10. **Report**: what was destroyed, what was revoked, the data-safety evidence, what is still running in the background, and any manual billing step. Admit any skipped gate up front.
 
 ## Pitfalls
+- Read the docs you are about to delete for shared infrastructure that lives in the account, such as a DNS zone delegated from the main domain, a chat server or a git forge. Then `dig` those names. Closing the account takes them down for everyone, so warn the user before closure and don't just delete the doc quietly.
 - Stopping or suspending an app does not stop volume or IP charges. Only destroying the resources ends billing.
 - A one-shot cron job fired early with `run` keeps its original `next_run_at`. Remove it after the background run reports, or it fires again.
