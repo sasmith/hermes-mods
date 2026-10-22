@@ -78,9 +78,10 @@ every time; the user should never have to look it up. Read it from the host over
 ssh, feed it to `pbcopy` on stdin (never argv, logs or chat), notify "paste with
 ⌘V", and clear the clipboard after ~2 min only if it still holds the password.
 If the host already has an opener helper that does this (check its host docs), use
-it instead of a bare `open <url>`. Also put the password in the same chat message
-and in the link (`vnc.html?autoconnect=1&resize=scale&password=<pw>`): a link alone,
-or a password only inside a rendered user-step card, leaves the user unable to connect.
+it instead of a bare `open <url>`. In the chat message give the viewer address
+without credentials (`vnc://<host>:<port>` or `vnc.html?autoconnect=1&resize=scale`)
+and say the password is on their clipboard and in their keychain/vault. Never put the
+password in chat, in the URL, or in a card, comment or other durable field.
 x11vnc `-rfbauth` files are DES-obfuscated with VNC's fixed key and only the first 8
 chars count: `head -c8 <file> | openssl enc -d -des-ecb -K e84ad660c4721ae0 -nopad
 -provider legacy -provider default | tr -d '\0'`.
