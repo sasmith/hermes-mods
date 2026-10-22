@@ -67,6 +67,15 @@ CHECK: <check name> [args]          (optional; must exist in config `checks`)
 DEADLINE: 2026-10-18T19:55-07:00    (optional; hard deadline, e.g. an invite expiry)
 ```
 
+**Creating a card parked (`initial_status='blocked'`):** `kanban_create` takes no block reason, so the board shows
+none and the human can't tell what's wanted. Right after creating it, post a `kanban_comment` in this format
+(ACTION + UNBLOCKS-WHEN at minimum). Or create it ready and put the questions in a comment.
+
+**Diagnosing "why is X blocked?":** `kanban_show` it and read `events` and `runs`. A `blocked` event with reason
+`initial_status` and no runs means it was parked at creation, and no worker ever ran. The real asks are then in
+the body ("Open items", questions). A user comment alone never unblocks a card. Tell them the exact answers needed,
+then comment + `kanban_unblock` for them. The blocked-panel Desktop plugin's *Reply & unblock* does both in one step.
+
 Keys may be on separate lines or run together in one line; `ACTION:` may repeat. Free-text reasons still
 work through heuristics (imperative sentences kept, shipping/status chatter dropped, `expires <date>` and
 `before/after HH:MM PT` picked up), but the structured form gives a clean one-liner.
