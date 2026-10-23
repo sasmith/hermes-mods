@@ -188,7 +188,11 @@ class TestPoolRotationCycle:
     def test_first_429_past_live_wait_cap_rotates_in_core(self, reset_at):
         # Core (fork f8ff20e57b) rotates on the first 429 once the window exceeds
         # LIVE_RETRY_WAIT_CAP_S (60s), below this plugin's own 600s cutoff; an
-        # infinite reset parses as an infinitely long window.
+        # infinite reset parses as an infinitely long window. Unpatched upstream core
+        # has no such branch; the plugin's own >600s rotate is test_exact_cutoff's.
+        from test_plugin_contract import core_rotates_past_live_cap
+        if not core_rotates_past_live_cap():
+            pytest.skip("core lineage without the 60s first-429 rotate (unpatched upstream)")
         agent, pool, entries = self._make_agent_with_pool(3)
         with patch("agent.fallback_cooldown.time.time", return_value=2_000_000_000):
             recovered, has_retried = agent._recover_with_credential_pool(

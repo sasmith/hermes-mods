@@ -14,7 +14,7 @@ class Combined(unittest.TestCase):
     def setUp(self):
         gc.collect()
         import tempfile
-        temp = patch.object(tempfile, 'tempdir', '/Users/daveey/.hermes/cache/scratch')
+        temp = patch.object(tempfile, 'tempdir', str(Path.home() / '.hermes' / 'cache' / 'scratch'))
         temp.start()
         self.addCleanup(temp.stop)
         Backend.setUp(self)
@@ -239,12 +239,22 @@ class Combined(unittest.TestCase):
     def test_unselected_short_unknown_and_exact_cutoff_unchanged(self):
         # Core (fork f8ff20e57b) rotates on the first 429 once the window exceeds
         # LIVE_RETRY_WAIT_CAP_S (60s); the plugin's >600s bump only re-enters that
-        # same rotate branch. Unknown and short windows still retry once.
+        # same rotate branch. Unknown and short windows still retry once. Unpatched
+        # upstream core has no 60s branch: there only the plugin's >600s bump rotates.
+        import inspect
         from agent import agent_runtime_helpers as h
         from agent.retry_utils import LIVE_RETRY_WAIT_CAP_S
         manager = self.load()
         self.assert_active(manager)
-        cap = int(LIVE_RETRY_WAIT_CAP_S)
+        probe = Mock(return_value=True)
+        pool = Mock()
+        pool.entries.return_value = []
+        pool.current.return_value = None
+        with patch('agent.fallback_cooldown.time.time', return_value=2_000_000_000):
+            inspect.unwrap(h._recover_rate_limit)(pool, has_retried_429=False,
+                error_context={'reset_at': 2_000_000_061}, api_key_hint=None, credential_id=None,
+                rotate_and_swap=probe)
+        cap = int(LIVE_RETRY_WAIT_CAP_S) if probe.called else 600
         for delay in (None, 30, cap, cap + 1, 599, 600, 601):
             pool = Mock()
             pool.entries.return_value = []

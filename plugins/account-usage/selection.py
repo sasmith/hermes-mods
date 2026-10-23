@@ -895,10 +895,10 @@ class ExecutionIntegration:
             if reason not in {FailoverReason.rate_limit, FailoverReason.billing,
                               FailoverReason.auth, FailoverReason.model_entitlement}:
                 return False, has_retried_429
-            failure = reason.value
-            if reason == FailoverReason.billing and billing_unverified:
-                from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
-                failure = FAILURE_REASON_BILLING_UNVERIFIED
+            # Core's mapping: a usage-window 402 benches only the refused model; an
+            # unverified billing body gets the short cooldown, not the 1-hour bench.
+            from agent.credential_pool_model_cooldowns import pool_failure_reason
+            failure = pool_failure_reason(reason, error_context, billing_unverified)
             default_status = {FailoverReason.billing: 402, FailoverReason.auth: 401,
                               FailoverReason.rate_limit: 429, FailoverReason.model_entitlement: 400}[reason]
             row = pool.mark_exhausted_and_rotate(status_code=status_code if status_code is not None else default_status,

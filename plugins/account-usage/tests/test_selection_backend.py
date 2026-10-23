@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
+sys.path.insert(0, os.environ.get('HERMES_AGENT_ROOT') or str(Path.home() / '.hermes' / 'hermes-agent'))
 import hermes_bootstrap
 sys.path.insert(0, str(Path(__file__).parent))
 from test_request_selection import selection, entry

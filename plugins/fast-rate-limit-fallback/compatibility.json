@@ -5,10 +5,17 @@
   ],
   "agent.agent_runtime_helpers:recover_with_credential_pool": [
     "20ea3a38b6c5303a0c91ac4c234b107d119caa23c6e1ef75c1e9f4e5154b6593",
-    "d7211583d0a8c994e1330db9fe94db2ed361e5a020db6016fa1a3059f3ce49d3"
+    "d7211583d0a8c994e1330db9fe94db2ed361e5a020db6016fa1a3059f3ce49d3",
+    "8670ca2a9a87de9013c788830783604973e269e34fd1853c9b8cfce098e70b8e"
   ],
-  "agent.turn_recovery:route_classified_error": "b80563e5cf9c7752166672eb5a98ebe8dd04ab942e9b8c433f32b1bdd110e7fb",
-  "agent.turn_api_error:handle_api_error": "a0eb84c79bfadabbb048fb495a88a16223a3966abb388b62f5748a24f64e989b",
+  "agent.turn_recovery:route_classified_error": [
+    "b80563e5cf9c7752166672eb5a98ebe8dd04ab942e9b8c433f32b1bdd110e7fb",
+    "9a300a1ff7d8f38815916dbffc4822fed6a057e4db1161467dc4b529a74b0a60"
+  ],
+  "agent.turn_api_error:handle_api_error": [
+    "a0eb84c79bfadabbb048fb495a88a16223a3966abb388b62f5748a24f64e989b",
+    "4c6a2c2a7ab179ca671c799bf3fbda73585024709bac4323cc3c3b693ec973fe"
+  ],
   "run_agent:_pool_may_recover_from_rate_limit": "b7c4e8ad30e5f95dc61ae170248531d7ab17735ac3ac812567da2b5c97d87516",
   "agent.fallback_cooldown:_provider_reset_delay": "66a8d1cdf2fe41685e23a48dbd5a413fcc2664edfd4e164f44bbdd4ce977727c"
 }

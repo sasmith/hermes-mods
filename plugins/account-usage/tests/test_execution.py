@@ -280,6 +280,32 @@ class Execution(unittest.TestCase):
         self.assertEqual(sent[0].entry_id, 'A')
         self.assertFalse(hasattr(a, '_account_usage_retry_snapshot'))
 
+    def test_selected_recovery_uses_core_pool_failure_reason(self):
+        # Same failure_reason as core's recover_with_credential_pool: a usage-window 402
+        # benches only the refused model, an unverified billing body the short cooldown.
+        from agent import agent_runtime_helpers as runtime
+        from agent.credential_pool import CredentialPool, FAILURE_REASON_BILLING_UNVERIFIED
+        from agent.credential_pool_model_cooldowns import FAILURE_REASON_USAGE_WINDOW
+        from agent.error_classifier import FailoverReason
+        a = self.agent
+        rows = [entry('A', source='manual'), entry('B', source='manual')]
+        pool = CredentialPool('anthropic', rows)
+        a._credential_pool = pool
+        snapshot = self.s.CredentialSnapshot(a.provider, a.model, 'account-B', 'B', a.base_url, rows[1].runtime_api_key)
+        integration = self.s.ExecutionIntegration(observe=lambda *args: None)
+        integration.install()
+        self.addCleanup(integration.unload)
+        cases = [({'usage_window': True, 'reset_at': 4102444800.0}, False, FAILURE_REASON_USAGE_WINDOW),
+                 ({}, True, FAILURE_REASON_BILLING_UNVERIFIED), ({}, False, 'billing')]
+        for context, unverified, expected in cases:
+            a._account_usage_failed_attempt = snapshot
+            with patch.object(pool, 'mark_exhausted_and_rotate', return_value=None) as rotate:
+                self.assertEqual(runtime.recover_with_credential_pool(a, status_code=402, has_retried_429=False,
+                    classified_reason=FailoverReason.billing, error_context=context,
+                    billing_unverified=unverified), (False, False))
+            self.assertEqual(rotate.call_args.kwargs['failure_reason'], expected)
+            self.assertEqual(rotate.call_args.kwargs['credential_id'], 'B')
+
     def test_full_turn_unavailable_selection_never_sends_another_account(self):
         import httpx
         from run_agent import AIAgent

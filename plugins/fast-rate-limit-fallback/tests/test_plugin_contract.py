@@ -6,6 +6,23 @@ import logging
 import pytest
 
 
+def core_rotates_past_live_cap():
+    """True on core lineages whose own _recover_rate_limit rotates on the first 429 once the
+    window exceeds LIVE_RETRY_WAIT_CAP_S (60s; fork f8ff20e57b). Unpatched upstream retries
+    once instead, so only the plugin's >600s cutoff rotates early. Probes the unwrapped core."""
+    import inspect
+    import agent.agent_runtime_helpers as helpers
+    core = inspect.unwrap(helpers._recover_rate_limit)
+    pool = MagicMock()
+    pool.entries.return_value = []
+    pool.current.return_value = None
+    rotate = MagicMock(return_value=True)
+    with patch('agent.fallback_cooldown.time.time', return_value=2_000_000_000):
+        core(pool, has_retried_429=False, error_context={'reset_at': 2_000_000_061},
+             api_key_hint=None, credential_id=None, rotate_and_swap=rotate)
+    return rotate.called
+
+
 def seams():
     import agent.agent_runtime_helpers as helpers
     import agent.turn_recovery as recovery
@@ -59,11 +76,13 @@ def test_incompatible_core_warns_and_leaves_all_seams_alone(loaded_local_plugin,
     ctx.on_unload.assert_not_called()
 
 
-# Core rotates past LIVE_RETRY_WAIT_CAP_S (60s) on its own since fork f8ff20e57b;
-# the plugin's 600s cutoff only re-enters that same rotate branch.
-@pytest.mark.parametrize('delay, rotated', [(30, False), (60, False), (61, True),
-                                            (599, True), (600, True), (601, True)])
-def test_exact_cutoff(delay, rotated):
+# Fork core rotates past LIVE_RETRY_WAIT_CAP_S (60s) on its own since f8ff20e57b; the
+# plugin's 600s cutoff only re-enters that same rotate branch. Upstream core retries once,
+# so there only a reset strictly past 600s rotates on the first 429.
+@pytest.mark.parametrize('delay, fork_rotated', [(30, False), (60, False), (61, True),
+                                                 (599, True), (600, True), (601, True)])
+def test_exact_cutoff(delay, fork_rotated):
+    rotated = fork_rotated if core_rotates_past_live_cap() else delay > 600
     import agent.agent_runtime_helpers as helpers
     pool = MagicMock()
     pool.entries.return_value = []

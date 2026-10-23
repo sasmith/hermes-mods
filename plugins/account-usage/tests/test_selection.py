@@ -6,13 +6,15 @@ Characterization pins the unsafe core seams (reclaim, _swap_credential) the
 plugin must never use; Contract pins the plugin's own path on the same fixtures.
 """
 from contextlib import ExitStack
+import os
+from pathlib import Path
 from types import SimpleNamespace
 import sys
 import time
 import unittest
 from unittest.mock import Mock, patch
 
-sys.path.insert(0, '/Users/daveey/.hermes/hermes-agent')
+sys.path.insert(0, os.environ.get('HERMES_AGENT_ROOT') or str(Path.home() / '.hermes' / 'hermes-agent'))
 import hermes_bootstrap  # noqa: F401
 from agent.credential_pool import CredentialPool, PooledCredential
 from agent.client_lifecycle import ClientLifecycleMixin
