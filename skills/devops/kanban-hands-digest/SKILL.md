@@ -114,6 +114,12 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 
 ## Pitfalls
 
+- Desktop/TUI chat sessions are never pinged when a card is escalated to triage. `tui_gateway/session_notifications.py`
+  `_KANBAN_NOTIFY_KINDS` omits `block_loop_detected` (and `review_requested`/`changes_requested`); the gateway
+  notifier has them. A worker's second identical `needs_input` block therefore goes silent: the card sits in triage
+  and the session's subscription cursor stays behind the event. Upstream fix: NousResearch/hermes-agent#119570.
+  Until it lands, check this session's cards for `triage` whenever the user asks about progress.
+
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
 - Checks that read a remote DB must not `.backup` a big live database per call (tens of seconds); open
