@@ -32,8 +32,30 @@ task strip, then `kanban_show` each and report the blocked ones. Also report two
 Re-read each card (`kanban_show`: status, latest comments) right before presenting an ask. The user often
 answers from the Desktop board (a comment by `desktop`), and the worker resumes on its own, so a question
 relayed from an earlier notification may already be stale. When relaying the user's answer to a blocked card,
-or when the user's step is done, post a `kanban_comment` saying what changed, re-queue the card yourself
-(`kanban_unblock`, or the CLI for triage), then read the status back. Don't wait for the card to notice.
+or when the user's step is done, post a `kanban_comment` saying what changed, re-queue the card yourself,
+then read the status back. Don't wait for the card to notice. `kanban_unblock` works for blocked/scheduled
+cards; for `triage` it, `kanban unblock` and `kanban promote` all refuse — use the `specify_triage_task`
+move in `kanban-wait-watchdog` (no body rewrite), or ask the user to drag the card to Ready.
+Closing a triage card has the same wall. `complete_task` only accepts running, ready, blocked or review, so
+`kanban_complete`, `hermes kanban complete --force`, `kanban block` and `request-review` all refuse a triage
+card, and the errors look like "unknown id". **Don't ask the user to drag it to Done**: the dashboard sends no
+summary, and the empty-evidence guard rejects the drop ("completion blocked: <id> has no result or summary
+evidence"). A comment doesn't count as evidence. In a normal session (not a worker), close it yourself:
+move it triage→blocked, which never dispatches, then complete it with the summary in the same script. Run it the same way as in
+`kanban-wait-watchdog`: a temporary module in the hermes-agent root run with `hermes --run-module`. Any
+Python that can import `hermes_cli` from that dir also works; it prints plugin and SQLite warnings, which
+are harmless here.
+```python
+from hermes_cli import kanban_db as k
+from hermes_cli.kanban_db_connect import connect
+conn = connect()
+with k.write_txn(conn):
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=? AND status='triage'", (tid,))
+k.complete_task(conn, tid, summary="<acceptance evidence>", metadata={...}, force=True)
+```
+Then check `hermes kanban show <id>`: status should be `done`, and the summary should sit on the new completed
+run. Moving it to Ready first instead risks the dispatcher spawning a worker before you complete it. Name the
+cards that wait on it so the user knows what this releases.
 Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
 say it's a global view.
@@ -114,11 +136,19 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 
 ## Pitfalls
 
-- Desktop/TUI chat sessions are never pinged when a card is escalated to triage. `tui_gateway/session_notifications.py`
-  `_KANBAN_NOTIFY_KINDS` omits `block_loop_detected` (and `review_requested`/`changes_requested`); the gateway
-  notifier has them. A worker's second identical `needs_input` block therefore goes silent: the card sits in triage
-  and the session's subscription cursor stays behind the event. Upstream fix: NousResearch/hermes-agent#119570.
-  Until it lands, check this session's cards for `triage` whenever the user asks about progress.
+- Desktop/TUI chat sessions may not be pinged when a card is escalated to triage: if
+  `tui_gateway/session_notifications.py` `_KANBAN_NOTIFY_KINDS` lacks `block_loop_detected` (and
+  `review_requested`/`changes_requested`, which the gateway notifier has), a worker's second identical
+  `needs_input` block goes silent and the card sits in triage. Check `grep -n "_KANBAN_NOTIFY_KINDS ="` in the
+  install; if the kinds are missing, the fix is adding them plus formatters in `_KANBAN_EVENT_FORMATTERS`,
+  committed on the user's local patches branch (restart the desktop app to load it). Until then, check this
+  session's cards for `triage` whenever the user asks about progress. For alerts off the laptop, offer a
+  messaging-platform subscription or a no-agent cron running the digest with `--checks-only`-style change
+  detection.
+- Cards from `kanban_create` may be subscribed as `platform=local` (mode notify+wake), which the desktop/TUI poller
+  ignores (it only claims `platform=tui`), so their blocks never reach the chat. After creating a card, check
+  `hermes kanban notify-list <id>` and add `hermes kanban notify-subscribe <id> --platform tui --chat-id <session id>`
+  if only a `local` sub exists.
 
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
