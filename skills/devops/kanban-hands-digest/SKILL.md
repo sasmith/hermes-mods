@@ -60,6 +60,11 @@ Go global (the digest script below, all
 boards) only when the user says so ("globally", "all boards", "everything") or the session has no cards — then
 say it's a global view.
 
+**This user expects the session to track the cards it filed and tell them when one blocks, crashes or gives
+up**, not to discover stalls later. After every `kanban_create`, confirm a `tui` subscription (pitfall below).
+When the user returns to the project or asks for state, check every card this session filed first and report
+any that sat blocked/crashed, with how long; time a card spent waiting unnoticed is the delay they notice.
+
 ## Global digest
 
 ```
@@ -149,6 +154,11 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
   ignores (it only claims `platform=tui`), so their blocks never reach the chat. After creating a card, check
   `hermes kanban notify-list <id>` and add `hermes kanban notify-subscribe <id> --platform tui --chat-id <session id>`
   if only a `local` sub exists.
+- Moving a card out of `triage`: `kanban_unblock`, `hermes kanban promote` and `complete` all refuse it, and
+  the dashboard API needs auth. From `~/.hermes/hermes-agent`, the Hermes runtime venv python with
+  `PYTHONPATH=.` can call `plugins.kanban.dashboard.plugin_api._set_status_direct(kanban_db_connect.connect(),
+  <id>, "todo"|"ready")` (the allowed triage moves). A card with open parents lands in `todo`; `ready`
+  dispatches at once.
 
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
