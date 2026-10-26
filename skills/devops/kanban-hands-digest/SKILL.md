@@ -34,8 +34,9 @@ answers from the Desktop board (a comment by `desktop`), and the worker resumes 
 relayed from an earlier notification may already be stale. When relaying the user's answer to a blocked card,
 or when the user's step is done, post a `kanban_comment` saying what changed, re-queue the card yourself,
 then read the status back. Don't wait for the card to notice. `kanban_unblock` works for blocked/scheduled
-cards; for `triage` it, `kanban unblock` and `kanban promote` all refuse — use the `specify_triage_task`
-move in `kanban-wait-watchdog` (no body rewrite), or ask the user to drag the card to Ready.
+cards; for `triage` it, `kanban unblock` and `kanban promote` all refuse — move it yourself with
+`_set_status_direct` (Pitfalls: moving a card out of triage), or the `specify_triage_task` move in
+`kanban-wait-watchdog` (no body rewrite). Don't hand the drag to the user; they keep triage clear.
 Closing a triage card has the same wall. `complete_task` only accepts running, ready, blocked or review, so
 `kanban_complete`, `hermes kanban complete --force`, `kanban block` and `request-review` all refuse a triage
 card, and the errors look like "unknown id". **Don't ask the user to drag it to Done**: the dashboard sends no
@@ -152,14 +153,19 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
   detection.
 - Cards from `kanban_create` may be subscribed as `platform=local` (mode notify+wake), which the desktop/TUI poller
   ignores (it only claims `platform=tui`), so their blocks never reach the chat. After creating a card, check
-  `hermes kanban notify-list <id>` and add `hermes kanban notify-subscribe <id> --platform tui --chat-id <session id>`
-  if only a `local` sub exists.
+  `hermes kanban notify-list <id>` and add `hermes kanban notify-subscribe <id> --platform tui --chat-id
+  "$HERMES_SESSION_KEY"` if only a `local` sub exists. The chat id must be the full session key
+  (`agent:main:local:dm:<session id>`), not the bare session id: the poller matches `chat_id == session_key`,
+  so a bare-id sub silently never advances.
+- With `kanban.auto_decompose: true`, a card that lands in `triage` from a block loop gets split by the
+  decomposer about a minute later into child cards that gate it and start re-doing finished work (upstream
+  #125207). After a block loop on a human ask, reclaim/unlink/archive any `decomposed` children, and park the
+  card with `_set_status_direct` triage→todo→scheduled (no wake time) until the human answers.
 - Moving a card out of `triage`: `kanban_unblock`, `hermes kanban promote` and `complete` all refuse it, and
   the dashboard API needs auth. From `~/.hermes/hermes-agent`, the Hermes runtime venv python with
   `PYTHONPATH=.` can call `plugins.kanban.dashboard.plugin_api._set_status_direct(kanban_db_connect.connect(),
   <id>, "todo"|"ready")` (the allowed triage moves). A card with open parents lands in `todo`; `ready`
   dispatches at once.
-
 - A `mode=ro` sqlite open can fail transiently while a writer truncates the WAL; the reader retries,
   then falls back to `query_only`.
 - Checks that read a remote DB must not `.backup` a big live database per call (tens of seconds); open
