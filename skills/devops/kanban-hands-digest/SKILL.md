@@ -157,6 +157,15 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
   "$HERMES_SESSION_KEY"` if only a `local` sub exists. The chat id must be the full session key
   (`agent:main:local:dm:<session id>`), not the bare session id: the poller matches `chat_id == session_key`,
   so a bare-id sub silently never advances.
+- **Alex's install has the durable fixes applied** (branch `local/patches-v0.22.5`): upstream #128677
+  (local commit 864765308e) and #125207 (0b5bfb9845). With them, a re-block whose reason changed escalates
+  only at 4 recurrences instead of 2 (`block_recurrences` still counts up; a comment or heartbeat is not
+  progress, only a review cycle resets the streak), and `decompose_task` refuses a `block_loop_detected`
+  triage card, so auto-decompose leaves it for the human. A same-reason re-block still goes to triage, so
+  the triage moves above still apply. The child clean-up in the next bullet is a fallback for when
+  `decomposed` children show up anyway: the patches got dropped by `hermes update` before upstream merged
+  them, or it's another install. Check with `git -C ~/.hermes/hermes-agent log --oneline -30` for the two
+  `local: apply upstream` commits, or whether the PRs merged.
 - With `kanban.auto_decompose: true`, a card that lands in `triage` from a block loop gets split by the
   decomposer about a minute later into child cards that gate it and start re-doing finished work (upstream
   #125207). After a block loop on a human ask, reclaim/unlink/archive any `decomposed` children, and park the
