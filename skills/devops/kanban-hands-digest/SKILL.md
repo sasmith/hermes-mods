@@ -182,7 +182,13 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 - **Alex's install has the durable fixes applied** (branch `local/patches-v0.22.5`): upstream #128677
   (local commit 864765308e) and #125207 (0b5bfb9845), plus a local sleep-aware dispatch patch
   (2de0b2a3ff: no spawn/reap in a DarkWake, sleep-spanning runs requeued as `interrupted_by_sleep`
-  without spending a retry, turn-lease renewal after sleep). With them, a re-block whose reason changed escalates
+  without spending a retry, turn-lease renewal after sleep), and f25f16e5e0 (exit-78 provider rejections retry
+  after 5 then 30 min, a same-minute multi-card rejection is an uncounted blip, terminal-provider crashes
+  are silent, a provider give-up sends one grouped message, and a local chat gets every `gave_up` as a
+  transcript note). On `platform=local` an advanced sub cursor does NOT prove the user saw the event:
+  `send()` there is a no-op and the wake turn is the delivery, so a turn that failed (e.g. no provider
+  credential) loses it; read the chat transcript, not the cursor. `--platform tui` subs never deliver
+  (no `tui` adapter in the gateway); the live sub is the `local` one. With them, a re-block whose reason changed escalates
   only at 4 recurrences instead of 2 (`block_recurrences` still counts up; a comment or heartbeat is not
   progress, only a review cycle resets the streak), and `decompose_task` refuses a `block_loop_detected`
   triage card, so auto-decompose leaves it for the human. A same-reason re-block still goes to triage, so
@@ -221,6 +227,13 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
   cursors so a backlog doesn't burst into the chat (when the user prefers that):
   `UPDATE kanban_notify_subs SET last_event_id=(SELECT coalesce(max(id),last_event_id) FROM task_events e
   WHERE e.task_id=kanban_notify_subs.task_id) WHERE platform IN ('local','tui')` in `~/.hermes/kanban.db`.
+- **Several cards `crashed` → `gave_up` in the same second with exit 78 ("terminal provider error: the
+  provider rejected this profile's credential")** is a transient provider or OAuth blip, not a card
+  problem, and it gives up without pinging the chat. Check `hermes auth list` (and that this session's own
+  calls work), then comment "resume from your branch and notes; don't redo finished work; approvals
+  stand" and `hermes kanban unblock` each. Read back status about 90 s later to confirm they're
+  `running` with no new error. On any "ping" or status check, look for `gave_up` events on this session's
+  cards, since nothing else surfaces them.
 - **A `crashed` card whose worker output ends in a question to the user** means the worker wrote its ask as
   plain text and exited instead of calling `kanban_block`; the dispatcher just respawns it. Read the
   `worker_output` of the `crashed` event, then check the real side effects yourself (stack status, the
@@ -275,8 +288,14 @@ ordering, grouping, check runner + auto-unblock through a fake `hermes` binary (
 - **After a gateway restart, alerts for events you already handled can arrive late** (a `gave_up` or
   `crashed` you already diagnosed). Before acting, list the card's events after the last one you
   handled; if there's nothing new, say it's the delayed copy and restate the one pending ask.
+- **One "deploy" with two cards waiting for deploy approval:** apply it to the card the last
+  message was about, and in the same reply ask whether the other should deploy too (after the
+  first finishes). Don't silently unblock both, and don't leave the second one unmentioned.
 - **Reference a card id only after `kanban_create` returns it.** Writing "card t_… will do X" in a
   comment before creating that card puts an invented id on the board; create first, then comment.
+  The usual trap is batching `kanban_create` and a `kanban_comment` that names the new card in the
+  same parallel tool call: the comment can't know the id, so run them in sequence. If an invented
+  id already landed, post a one-line correction comment with the real id.
 - **Workers sometimes offer to take secrets pasted in chat** ("send me the key and secret"). Don't
   relay that offer. Tell the user to add the values to the secret store themselves, and add "never
   ask for secrets in chat" to the relay comment.
