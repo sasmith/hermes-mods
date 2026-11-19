@@ -37,6 +37,11 @@ hermes config set skills.external_dirs '["~/code/hermes-mods/skills"]'
   code, tests, gotchas), plus `git am`-ready patches, so you or your agent can add them to your
   Hermes. Start with [core/README.md](core/README.md).
 - **[shortcuts.md](shortcuts.md)**: every keyboard shortcut these mods add, and how to get each one.
+- **[scripts/notify-pr-chat.py](scripts/notify-pr-chat.py)**: for a PR-followup cron, routes an
+  "I can't fix this" PR notice to the Desktop chat that owns the PR, as a blocked Kanban card. It
+  matches only the full `owner/repo#n`, the PR URL or the branch (not a bare `#n`), ignores messages
+  that are themselves notifications, prefers the chat that discussed the PR most, and keeps a card's
+  existing chat. Link it as `~/.hermes/scripts/notify-pr-chat.py`. Tests: `tests/test_notify_pr_chat.py`.
 - **[hermes-pack.yaml](hermes-pack.yaml)**: the community plugins I use, pinned
   (`hermes plugins pack install hermes-pack.yaml`).
 
