@@ -30,7 +30,7 @@ HERMES_BIN = next(
 
 
 def find_owning_chat(pr_key: str, branch: str) -> str | None:
-    """Return the session_id of the Desktop chat that worked on this PR, or the most recent active Desktop chat.
+    """Return the session_id of the Desktop chat that worked on this PR, or None if no chat did.
 
     Matching is strict on purpose: only the full `owner/repo#n`, the PR URL, or the branch name count
     (bare `#n` matched unrelated numbers such as `#119570`). Messages that are themselves PR-attention or
@@ -72,18 +72,10 @@ def find_owning_chat(pr_key: str, branch: str) -> str | None:
             s[1] = min(s[1], ts or 0)
         if score:
             return max(score.items(), key=lambda kv: (kv[1][0], -kv[1][1]))[0]
-
-        fallback = conn.execute(
-            """
-            SELECT s.id
-            FROM sessions s
-            WHERE s.source IN ('local', 'desktop')
-              AND COALESCE(s.title, '') != 'Bot Chat'
-            ORDER BY s.last_activity_at DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        return str(fallback[0]) if fallback and fallback[0] else None
+        # No chat discussed this PR (e.g. it was opened outside Hermes). Don't guess: the most
+        # recently active chat is usually unrelated. The card stays on the board, and the cron's own
+        # final response still reaches Bot Chat.
+        return None
     finally:
         conn.close()
 

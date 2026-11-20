@@ -61,3 +61,11 @@ def test_longer_pr_number_does_not_match(tmp_path):
         ("b", "B", 2, 2, f"{PR} is ours"),
     ])
     assert mod.find_owning_chat(PR, "") == "b"
+
+
+def test_no_discussing_chat_means_no_owner(tmp_path):
+    mod = load(tmp_path, [
+        ("busy", "Busy", 9, 1, "unrelated work, completed_at 1792732521"),
+        ("other", "Other", 5, 2, "acme/widget#1190 and #119"),
+    ])
+    assert mod.find_owning_chat(PR, BRANCH) is None
